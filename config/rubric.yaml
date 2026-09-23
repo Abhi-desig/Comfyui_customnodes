@@ -1,0 +1,134 @@
+# QC rubric for the Claude judge (adapters/claude_judge.py).
+#
+# Design constraints this file exists to satisfy (see task brief):
+#   - binary yes/no checks only, no 1-10 scores
+#   - each check: name, question, required (bool), optional exemplar image paths
+#   - `required: false` checks are still asked (for context / grounding) but
+#     never gate `QCVerdict.passed` — see claude_judge.py's `_combine()` for
+#     why (QCVerdict.passed ANDs every entry in `checks`, and that model is
+#     frozen, so only required checks are allowed into that list).
+
+model: claude-opus-5
+# Cost lever: swap `model` for this when a batch needs to run cheaper. Quality
+# drops some; self-consistency (below) is what keeps cheap-mode usable.
+cost_lever_model: claude-sonnet-5
+
+effort: low          # a QC judge doesn't need deep reasoning per image
+max_tokens: 4096
+cache_ttl: 1h
+
+self_consistency:
+  n: 3               # majority vote; set to 1 for cheap mode (no vote, no cost x3)
+
+retry:
+  max_attempts: 2              # extra attempts after the first, per failure class
+  retry_after_default_s: 5.0   # used when a 429 response carries no retry-after header
+  overload_backoff_base_s: 4.0 # 529 backs off harder than 429, and grows per attempt
+
+content_validation:
+  min_evidence_length: 8       # shorter than this reads as templated, not observed
+
+fix:
+  # `delta` is clamped into these bounds regardless of what the model proposes.
+  bounds:
+    adjust_steps: {min: -10, max: 10}
+    adjust_strength: {min: -0.3, max: 0.3}
+  # `rewrite_slot` may only target one of these — anything else is rejected
+  # outright (downgraded to action "none"). This is the prompt-injection
+  # envelope: a hijacked judge can move within named slots, never write
+  # arbitrary free text into the generation prompt.
+  slot_allowlist:
+    - background
+    - subject_position
+    - lighting
+    - color_grade
+    - camera_angle
+  max_text_length: 280
+
+# Six required checks + two optional (nice-to-have, non-blocking) checks —
+# within the 6-8 total the design calls for.
+checks:
+  - name: subject_present
+    question: >-
+      Is the main subject described in the creative brief clearly visible,
+      fully in frame, and not occluded or cropped off?
+    required: true
+
+  - name: no_artifacts
+    question: >-
+      Is the image free of generation artifacts — garbled text, warped
+      objects, visible watermarks, or seams from inpainting/outpainting?
+    required: true
+
+  - name: anatomy_correct
+    question: >-
+      Are there no anatomical errors: no extra or missing limbs/fingers, no
+      malformed faces or hands?
+    required: true
+
+  - name: matches_brief
+    question: >-
+      Does the image match the scene, setting, and mood described in the
+      creative brief for this asset?
+    required: true
+
+  - name: brand_palette_match
+    question: >-
+      Does the overall colour palette read as on-brand (cohesive, no
+      clashing neon casts) rather than a jarring off-palette wash?
+    required: true
+
+  - name: lighting_quality
+    question: >-
+      Is the lighting coherent and natural-looking, without blown-out
+      highlights or crushed, detail-less shadows?
+    required: true
+
+  - name: composition_polish
+    question: >-
+      Is the composition well-balanced (e.g. roughly rule-of-thirds) rather
+      than accidental-looking?
+    required: false
+
+  - name: aesthetic_appeal
+    question: >-
+      Would this image, on its own merits, be appealing enough to stop a
+      scroll on paid social? (Nice-to-have — never blocks on its own.)
+    required: false
+
+# Shared few-shot images embedded once in the cached system prefix. Paths are
+# relative to this file's directory. Leave empty until reference assets exist;
+# wired up but inert.
+exemplar_images: []
+
+# Deterministic pre-checks (adapters/prefilter.py). numpy + Pillow only, no
+# network — an objective failure here means the API is never called for that
+# asset.
+prefilter:
+  min_variance_of_laplacian: 40.0    # below this reads as out-of-focus/blurry
+  brightness_min: 15.0               # mean 0-255; below = effectively all-black
+  brightness_max: 240.0              # above = effectively all-white/blown out
+  aspect_ratio_min: 0.4
+  aspect_ratio_max: 2.6
+  # Approximate AmberStudent brand colours (deep indigo / periwinkle / white).
+  # Swap for the real palette when the brand kit lands.
+  brand_palette_rgb:
+    - [26, 35, 126]
+    - [92, 107, 192]
+    - [255, 255, 255]
+  max_palette_distance: 140.0         # euclidean RGB distance; 0 disables the check
+  edge_margin_fraction: 0.02          # border band width, as a fraction of min(w, h)
+  edge_density_threshold: 0.35        # fraction of that band that must read as "not background"
+
+# $ per 1,000,000 tokens. Mirrors the Claude API pricing table; keep in sync
+# if prices change. cache_read/cache_write are multipliers on the input rate
+# (per Anthropic's documented ~0.1x / ~1.25x), not separate absolute rates.
+pricing:
+  claude-opus-5:
+    input_per_mtok: 5.00
+    output_per_mtok: 25.00
+  claude-sonnet-5:
+    input_per_mtok: 2.00
+    output_per_mtok: 10.00
+  cache_read_multiplier: 0.1
+  cache_write_multiplier: 1.25

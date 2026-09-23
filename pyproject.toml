@@ -1,0 +1,31 @@
+[project]
+name = "comfy-controller"
+version = "0.1.0"
+description = "Resilient overnight batch controller for ComfyUI"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.10",
+    "pydantic>=2.9",
+    "anthropic>=1.0",
+    "slack-sdk>=3.33",
+    "structlog>=24.4",
+    "psutil>=6.0",
+    "stamina>=24.3",
+    "pyyaml>=6.0",
+    "pillow>=10.4",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "hypothesis>=6.112"]
+
+[project.scripts]
+comfyctl = "comfy_controller.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

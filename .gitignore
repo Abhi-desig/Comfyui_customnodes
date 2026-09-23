@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.hypothesis/
+*.egg-info/
+dist/
+build/
+
+# runtime state — never commit
+*.db
+*.db-wal
+*.db-shm
+outputs/
+logs/
+.env
