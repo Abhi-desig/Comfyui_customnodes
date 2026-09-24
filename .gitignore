@@ -8,6 +8,7 @@ dist/
 build/
 
 # runtime state — never commit
+.comfy_supervisor/
 *.db
 *.db-wal
 *.db-shm
