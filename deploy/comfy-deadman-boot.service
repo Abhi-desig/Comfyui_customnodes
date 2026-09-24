@@ -1,0 +1,44 @@
+# deploy/comfy-deadman-boot.service
+#
+# Dead-man's switch, LAYER 1: schedules an unconditional `shutdown -h +N`
+# at boot, before comfyui.service or comfy-controller.service starts (see
+# `Before=` below). This is the layer that holds even if the controller, or
+# layer 2's own timer, never runs at all -- so it must not depend on
+# either. It is intentionally never re-armed by anything else; see
+# ops/deadman.sh's header comment for the full rationale.
+#
+# Two defenses against this unit failing to arm SILENTLY (the audit's
+# finding: DefaultDependencies=no + After=local-fs.target alone runs before
+# systemd-logind/D-Bus are up, which is exactly what `shutdown -h +N` needs
+# -- and Type=oneshot with no Restart=/OnFailure= before this made that
+# failure invisible):
+#
+#   1. After=/Wants= dbus.service + systemd-logind.service below, so this
+#      unit actually waits for (and pulls in) the thing `shutdown -h +N`
+#      depends on, instead of racing it. Kept alongside local-fs.target,
+#      not instead of it.
+#   2. OnFailure=comfy-deadman-alert.service, so if arm-boot-shutdown still
+#      fails (or exits non-zero because ops/deadman.sh's own fallbacks --
+#      an `at` job, then a detached background sleep+poweroff, neither of
+#      which need logind -- also couldn't arm), that failure is made LOUD
+#      (wall(1) + a CRIT journal entry) instead of sitting quietly as one
+#      more `systemctl status` nobody happened to check. See
+#      docs/runbook.md sect 6.
+
+[Unit]
+Description=Dead-man's switch layer 1: arm an unconditional boot-ceiling shutdown
+DefaultDependencies=no
+Before=comfyui.service comfy-controller.service shutdown.target
+Conflicts=shutdown.target
+After=local-fs.target dbus.service systemd-logind.service
+Wants=dbus.service systemd-logind.service
+OnFailure=comfy-deadman-alert.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/comfy-controller/deadman.env
+ExecStart=/opt/comfy-controller/ops/deadman.sh arm-boot-shutdown
+
+[Install]
+WantedBy=multi-user.target

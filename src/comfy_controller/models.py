@@ -155,13 +155,21 @@ FixAction = Literal["reseed", "adjust_steps", "adjust_strength", "rewrite_slot",
 
 
 class FixProposal(BaseModel):
-    """Enumerated and bounded. The judge never emits free text that reaches a
-    generation prompt — only an action from this closed vocabulary."""
+    """Enumerated and bounded: the judge picks an action from this closed
+    vocabulary, never a free-form instruction.
+
+    `text` is the one field whose content reaches a generation prompt, and it
+    does so only through the fixed template in `runner._apply_qc_fix` /
+    `compose_slot_text`: the phrase is character-allowlisted, length-capped,
+    and APPENDED to an allowlisted slot's existing text. It can refine what
+    the workflow author wrote; it cannot replace it, and it cannot introduce
+    newlines, markup, or quoting characters.
+    """
 
     action: FixAction = "none"
     delta: float | None = None          # adjust_* only; clamped by the applier
     slot: str | None = None             # rewrite_slot only; must be allowlisted
-    text: str | None = None             # rewrite_slot only; goes into a fixed template
+    text: str | None = None             # rewrite_slot only; appended via a fixed template
 
 
 class QCVerdict(BaseModel):

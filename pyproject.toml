@@ -18,6 +18,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "hypothesis>=6.112"]
+# Heavy, optional -- adapters/frame_consistency.py runs a pure numpy/Pillow
+# fallback with none of these installed. Install this extra to get the real
+# CLIP-embedding / LPIPS signals instead of the fallback proxies.
+consistency = ["torch>=2.2", "open_clip_torch>=2.24", "lpips>=0.1.4"]
 
 [project.scripts]
 comfyctl = "comfy_controller.cli:main"

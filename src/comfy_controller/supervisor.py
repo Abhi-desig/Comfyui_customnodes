@@ -153,12 +153,25 @@ class HealthSupervisor:
         self._restart_times.clear()
 
     async def aclose(self) -> None:
+        """Stop the event pump and shut down the ComfyUI process we spawned.
+
+        The child is ours: `_launch_new_process` started it, so leaving it
+        running after the controller exits strands a process holding the GPU
+        and the port, which the next run then cannot bind. A ComfyUI the
+        operator started themselves is never touched -- `self._proc` is only
+        set for one we launched.
+        """
         if self._pump_task is not None:
             self._pump_task.cancel()
             try:
                 await self._pump_task
             except (asyncio.CancelledError, Exception):
                 pass
+            self._pump_task = None
+        try:
+            await self._terminate_current_process()
+        except Exception:
+            logger.exception("supervisor_child_termination_failed")
 
     # -------------------------------------------------------------- assess()
 

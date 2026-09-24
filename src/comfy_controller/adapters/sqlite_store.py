@@ -25,6 +25,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Callable
 
 from ..models import (
     Asset,
@@ -38,6 +39,23 @@ from ..models import (
 # first time a DB is opened at a version below it. Kept minimal but real —
 # no down-migrations, no branching, just "get an old file to the current
 # shape."
+class SubmissionNotRecorded(RuntimeError):
+    """`record_submission` could not pin `comfy_prompt_id` to the row.
+
+    Loud on purpose. A dropped submission is invisible at the time and only
+    surfaces much later as reconciliation acting on a stale prompt_id.
+    """
+
+
+class DuplicatePromptId(SubmissionNotRecorded, sqlite3.IntegrityError):
+    """Two assets tried to own one `comfy_prompt_id`.
+
+    Also a `sqlite3.IntegrityError`, because that is exactly what it is and
+    what callers already catch -- the extra base just adds a message that
+    names the asset and prompt involved.
+    """
+
+
 _MIGRATIONS: list[tuple[int, str]] = [
     (
         1,
@@ -198,10 +216,14 @@ class SQLiteStore:
                 self._conn.execute("ROLLBACK")
                 raise
 
-    async def claim_next(self) -> AssetRecord | None:
-        return await asyncio.to_thread(self._claim_next_sync)
+    async def claim_next(
+        self, *, job_key_fn: Callable[[Asset, int], str] | None = None
+    ) -> AssetRecord | None:
+        return await asyncio.to_thread(self._claim_next_sync, job_key_fn)
 
-    def _claim_next_sync(self) -> AssetRecord | None:
+    def _claim_next_sync(
+        self, job_key_fn: Callable[[Asset, int], str] | None = None
+    ) -> AssetRecord | None:
         now = time.time()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -219,12 +241,21 @@ class SQLiteStore:
                     return None
 
                 asset_id = row["id"]
-                # Opaque per-attempt claim token. Not the deterministic
-                # content-hash from Asset.job_key(model_version, graph_hash)
-                # -- the store has neither of those -- just a unique value
-                # written atomically with the claim so record_submission and
-                # reconciliation have something to correlate against.
-                job_key = uuid.uuid4().hex
+                if job_key_fn is not None:
+                    # Deterministic, content-derived key (Asset.job_key +
+                    # this attempt number) so a re-run finds its own output
+                    # on disk via filename_prefix even if comfy_prompt_id was
+                    # never durably recorded -- see req #1 in the task brief.
+                    # The caller supplies this because the store alone has
+                    # neither model_version nor graph_hash to build it.
+                    asset = Asset.model_validate_json(row["asset_json"])
+                    next_attempt = row["attempt"] + 1
+                    job_key = job_key_fn(asset, next_attempt)
+                else:
+                    # Fallback used by existing callers/tests that don't pass
+                    # job_key_fn: an opaque per-attempt claim token, unique
+                    # but not reproducible across a restart.
+                    job_key = uuid.uuid4().hex
 
                 # The WHERE clause here -- not the BEGIN IMMEDIATE lock -- is
                 # what req #2 actually requires: even a second connection
@@ -267,19 +298,57 @@ class SQLiteStore:
                 # exists -- it hands the still-CLAIMED row back so the caller
                 # can probe ComfyUI's /history via the job_key-derived
                 # filename_prefix rather than the store ever guessing.
+                #
+                # One claim submits MANY prompts: one per QC-repair round, and
+                # one per frame of a sequence. `comfy_prompt_id` must always
+                # name the prompt currently in flight, so 'submitted' is an
+                # accepted prior state as well as 'claimed'. Guarding on
+                # 'claimed' alone silently dropped every submission after the
+                # first, pinning the column to round 0 -- after which a crash
+                # mid-round-1 let reconciliation find round 0's *succeeded*
+                # prompt and re-judge an image that had already been rejected.
+                # Prior prompt_ids are not lost: each one keeps its own
+                # `run_log` row, which is the audit trail for the whole claim.
                 cur = self._conn.execute(
-                    "UPDATE assets SET state='submitted', comfy_prompt_id=? WHERE id=? AND state='claimed'",
+                    """UPDATE assets SET state='submitted', comfy_prompt_id=?
+                       WHERE id=? AND state IN ('claimed', 'submitted')""",
                     (prompt_id, asset_id),
                 )
-                if cur.rowcount:
+                if cur.rowcount == 0:
+                    # Never silent: either the asset id is unknown or the row
+                    # moved to a state that has no business submitting a
+                    # prompt. Both mean the in-flight prompt_id would go
+                    # unrecorded, which is precisely the state reconciliation
+                    # cannot recover from.
                     row = self._conn.execute(
-                        "SELECT attempt FROM assets WHERE id=?", (asset_id,)
+                        "SELECT state FROM assets WHERE id=?", (asset_id,)
                     ).fetchone()
-                    self._log_run(
-                        asset_id, row["attempt"], AssetState.SUBMITTED,
-                        prompt_id=prompt_id, error_type=None, verdict_summary=None, duration=None,
+                    actual = row["state"] if row is not None else "<no such row>"
+                    raise SubmissionNotRecorded(
+                        f"record_submission({asset_id!r}, {prompt_id!r}) matched 0 rows: "
+                        f"state is {actual!r}, expected 'claimed' or 'submitted'"
                     )
+
+                row = self._conn.execute(
+                    "SELECT attempt FROM assets WHERE id=?", (asset_id,)
+                ).fetchone()
+                self._log_run(
+                    asset_id, row["attempt"], AssetState.SUBMITTED,
+                    prompt_id=prompt_id, error_type=None, verdict_summary=None, duration=None,
+                )
                 self._conn.execute("COMMIT")
+            except sqlite3.IntegrityError as exc:
+                # The UNIQUE constraint on comfy_prompt_id is deliberately
+                # kept (it is what structurally forbids two assets claiming
+                # one generation). Re-pointing this row at a prompt_id some
+                # OTHER row already owns means ComfyUI handed back a duplicate
+                # id, or two assets raced onto the same prompt -- unrecoverable
+                # here and never something to paper over.
+                self._conn.execute("ROLLBACK")
+                raise DuplicatePromptId(
+                    f"record_submission({asset_id!r}, {prompt_id!r}) violates the "
+                    f"UNIQUE constraint on comfy_prompt_id: {exc}"
+                ) from exc
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise

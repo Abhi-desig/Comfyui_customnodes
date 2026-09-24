@@ -1,0 +1,19 @@
+# deploy/comfy-deadman.timer
+#
+# Runs comfy-deadman.service (layer 2's heartbeat check) every few minutes.
+# Kept short relative to DEADMAN_HEARTBEAT_STALE_MIN (default 20min) so a
+# stale heartbeat is caught promptly rather than near the end of its own
+# staleness window.
+
+[Unit]
+Description=Periodic dead-man's-switch heartbeat check
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+Unit=comfy-deadman.service
+AccuracySec=10s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

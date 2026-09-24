@@ -1,0 +1,65 @@
+# deploy/comfy-controller.service
+#
+# The OS supervises the controller; the controller supervises ComfyUI (see
+# comfyui.service's header comment for why that split -- HealthSupervisor
+# needs a direct process handle on ComfyUI for its canary/restart logic, so
+# in the recommended deployment mode systemd never touches ComfyUI directly,
+# only the controller that spawns it).
+#
+# Restart=on-failure + RestartSec + the StartLimit* ceiling below exist so a
+# controller that is crashlooping (bad config, a bug, a poisoned manifest)
+# fails LOUD and STOPPED, rather than thrashing systemd restarts forever
+# while quietly burning GPU-hours on a box nobody is watching. Once
+# StartLimitBurst is hit within StartLimitIntervalSec, systemd stops trying
+# and the unit goes into `failed` -- that state is the signal a human needs
+# to see at 8am, not a wall of successful-looking restart log lines.
+#
+# ExecStart below is a placeholder: cli.py (src/comfy_controller/cli.py) is
+# being written concurrently by another agent and did not exist at the time
+# this unit was written. Confirm the actual entrypoint/subcommand
+# (`comfyctl <subcommand>`, per the `comfyctl` script defined in
+# pyproject.toml) once it lands, and update ExecStart accordingly.
+#
+# ExecStopPost runs ops/on_controller_stop.sh, which -- only on a genuinely
+# clean stop (systemd's $SERVICE_RESULT=success, i.e. the batch actually
+# finished, not a crash Restart=on-failure will retry) -- flushes outputs
+# with a final `sync_outputs.sh --once` and then terminates the instance via
+# `ops/deadman.sh terminate` (provider API first, local shutdown +
+# escalation as guaranteed fallback). This closes the "batch finished at
+# 03:00, box billed idle until 09:00" gap the audit found; see that script's
+# own header comment for exactly why it only acts on a clean stop. No
+# leading `-`: a genuine termination failure here is meant to mark this unit
+# `failed` so it's visible, not silent -- see ops/on_controller_stop.sh.
+#
+# Heartbeat contract (layer 2 of the dead-man's switch, NOT implemented by
+# this ops/ layer -- see ops/deadman.sh's own comment and
+# docs/runbook.md's "Heartbeat contract" section for the precise spec):
+# whatever runs as ExecStart here is expected to touch
+# DEADMAN_HEARTBEAT_FILE (default /opt/comfy-controller/.comfy_supervisor/heartbeat)
+# at least once per control-loop iteration, more often than
+# DEADMAN_HEARTBEAT_STALE_MIN (default 20min). Until that's wired up, layer
+# 2 will treat every run as a dead controller (fail-safe, not a false
+# alarm) -- see docs/runbook.md.
+
+[Unit]
+Description=Comfy overnight batch controller (HealthSupervisor + runner)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# TODO(operator): set these to match your deployment layout.
+User=comfy
+WorkingDirectory=/opt/comfy-controller
+EnvironmentFile=-/etc/comfy-controller/controller.env
+# TODO(operator): confirm the real subcommand once cli.py exists.
+ExecStart=/opt/comfy-controller/.venv/bin/comfyctl run
+ExecStopPost=/opt/comfy-controller/ops/on_controller_stop.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

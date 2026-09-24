@@ -23,7 +23,9 @@ from hypothesis import HealthCheck, settings
 from hypothesis.stateful import RuleBasedStateMachine, Bundle, consumes, invariant, multiple, rule
 from hypothesis import strategies as st
 
-from comfy_controller.adapters.sqlite_store import SQLiteStore
+import pytest
+
+from comfy_controller.adapters.sqlite_store import SQLiteStore, SubmissionNotRecorded
 from comfy_controller.models import Asset, AssetState, ExecutionError, QCVerdict, CheckResult
 
 
@@ -201,6 +203,7 @@ class StoreMachine(RuleBasedStateMachine):
         self._tmpdir = tempfile.mkdtemp()
         self.db_path = Path(self._tmpdir) / "store.db"
         self.store = SQLiteStore(self.db_path)
+        self.epoch = 0
         run(self.store.load_batch([Asset(id=i, workflow="w.json") for i in ASSET_IDS]))
 
     # ------------------------------------------------------------------ rules
@@ -211,11 +214,28 @@ class StoreMachine(RuleBasedStateMachine):
         if rec is None:
             return multiple()
         assert rec.state == AssetState.CLAIMED
-        return rec.asset.id
+        # Tagged with the current epoch: a crash_and_restart resolves every
+        # in-flight row behind the bundle's back, which makes any id minted
+        # before it stale.
+        return (rec.asset.id, self.epoch)
 
-    @rule(target=submitted, aid=consumes(claimed))
-    def do_submit(self, aid):
+    @rule(target=submitted, item=consumes(claimed))
+    def do_submit(self, item):
+        aid, _epoch = item
         prompt_id = f"p-{uuid.uuid4().hex}"
+        # A bundle entry can go stale behind our back: crash_and_restart
+        # reconciles in-flight rows to RETRY_WAIT, and the asset may since
+        # have been re-claimed under a *different* entry. So assert against
+        # the row's real state rather than predicting it -- recording a
+        # prompt is legal only from claimed/submitted, and the store must
+        # refuse loudly anywhere else rather than drop it silently.
+        row = self.store._conn.execute(
+            "SELECT state FROM assets WHERE id=?", (aid,)
+        ).fetchone()
+        if row["state"] not in ("claimed", "submitted"):
+            with pytest.raises(SubmissionNotRecorded):
+                run(self.store.record_submission(aid, prompt_id))
+            return multiple()
         run(self.store.record_submission(aid, prompt_id))
         return (aid, prompt_id)
 
@@ -234,8 +254,9 @@ class StoreMachine(RuleBasedStateMachine):
             kwargs["verdict"] = _sample_verdict(False)
         run(self.store.transition(aid, term_state, **kwargs))
 
-    @rule(aid=consumes(claimed))
-    def do_retry_from_claimed(self, aid):
+    @rule(item=consumes(claimed))
+    def do_retry_from_claimed(self, item):
+        aid, _epoch = item
         run(self.store.transition(aid, AssetState.RETRY_WAIT, retry_after_s=0))
 
     @rule(item=consumes(submitted))
@@ -251,6 +272,7 @@ class StoreMachine(RuleBasedStateMachine):
         del self.store
         gc.collect()
         self.store = SQLiteStore(self.db_path)
+        self.epoch += 1
         pending = run(self.store.needing_reconciliation())
         for rec in pending:
             # Stand-in for "checked ComfyUI, couldn't confirm either way" --

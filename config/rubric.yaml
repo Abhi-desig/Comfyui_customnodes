@@ -35,8 +35,11 @@ fix:
     adjust_strength: {min: -0.3, max: 0.3}
   # `rewrite_slot` may only target one of these — anything else is rejected
   # outright (downgraded to action "none"). This is the prompt-injection
-  # envelope: a hijacked judge can move within named slots, never write
-  # arbitrary free text into the generation prompt.
+  # envelope: a hijacked judge can refine a named slot, never write arbitrary
+  # free text into the generation prompt. The slot allowlist controls WHICH
+  # node; `runner.sanitize_slot_text` / `compose_slot_text` control WHAT goes
+  # in it — a character-allowlisted phrase, appended to (never replacing) the
+  # slot's authored text.
   slot_allowlist:
     - background
     - subject_position
@@ -119,6 +122,20 @@ prefilter:
   max_palette_distance: 140.0         # euclidean RGB distance; 0 disables the check
   edge_margin_fraction: 0.02          # border band width, as a fraction of min(w, h)
   edge_density_threshold: 0.35        # fraction of that band that must read as "not background"
+
+# Deterministic frame-to-frame consistency checker for SEQUENCE assets
+# (adapters/frame_consistency.py). Runs on every adjacent frame pair -- no
+# VLM call, no relation to the `checks`/`prefilter` sections above (those are
+# per-frame; this is cross-frame). See that module's docstring for the four
+# signals and what happens when torch/clip/lpips aren't installed.
+frame_consistency:
+  embedding_similarity_min: 0.92     # CLIP cosine sim (or histogram-correlation fallback) floor
+  perceptual_distance_max: 0.30      # LPIPS (or SSIM-fallback distance) ceiling; flicker/global-shift
+  tile_grid: [4, 4]
+  tile_distance_max: 40.0            # per-tile mean-colour-delta ceiling; localises the change
+  cumulative_brightness_drift_max: 20.0   # vs. the sequence's first frame, not just the previous one
+  cumulative_color_drift_max: 25.0
+  histogram_bins: 32
 
 # $ per 1,000,000 tokens. Mirrors the Claude API pricing table; keep in sync
 # if prices change. cache_read/cache_write are multipliers on the input rate

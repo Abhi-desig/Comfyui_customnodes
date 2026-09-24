@@ -1,0 +1,31 @@
+# deploy/comfy-deadman-alert.service
+#
+# OnFailure= target for comfy-deadman-boot.service (layer 1's arming unit).
+# Layer 1 not being armed is the single highest-severity state this whole
+# system can be in -- it's the layer that's supposed to hold even when
+# everything else (the controller, layer 2's timer, the heartbeat wiring)
+# is broken (see docs/runbook.md sect 6). A plain Type=oneshot unit with no
+# Restart= and no OnFailure= before this fix just sat `failed` quietly:
+# nobody the wiser until someone happened to run `systemctl status`.
+#
+# This unit exists purely to make that failure LOUD. It does not re-arm
+# anything itself -- the re-arming fallbacks (an `at` job, then a fully
+# detached background sleep+poweroff, neither depending on logind) live
+# inside ops/deadman.sh's own arm_boot_shutdown() and already ran, and
+# already failed, by the time this unit fires. There is no email/pager
+# wired up on a bare rented-GPU box, so this uses the two channels that are
+# always available: wall(1) to every logged-in terminal, and an
+# unmistakable CRIT-level journal entry any log shipper would catch.
+#
+# DefaultDependencies=no: this must be startable in the same very-early
+# boot context comfy-deadman-boot.service itself runs in, without pulling
+# in normal target dependency chains that unit deliberately skips.
+
+[Unit]
+Description=ALERT: dead-man's switch layer 1 failed to arm
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/bin/wall "CRITICAL: comfy-deadman-boot.service FAILED -- dead-man's switch layer 1 may NOT be armed. Run 'ops/deadman.sh status' and see docs/runbook.md sect 6 NOW."
+ExecStart=-/usr/bin/logger -p daemon.crit -t comfy-deadman-alert "layer 1 (boot-ceiling shutdown) failed to arm -- see docs/runbook.md sect 6 and: journalctl -u comfy-deadman-boot.service"

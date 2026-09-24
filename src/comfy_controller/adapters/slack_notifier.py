@@ -41,6 +41,25 @@ log = structlog.get_logger(__name__)
 _MAX_LISTED = 20  # cap per-section detail lines; the full counts still show
 
 
+def mrkdwn_escape(text: Any) -> str:
+    """Escape the three characters Slack's mrkdwn parser treats as markup.
+
+    Everything interpolated into a block here is untrusted: asset ids come
+    from an operator's manifest, and `critique` is model output. Slack's link
+    syntax is `<url|label>`, so an unescaped critique reading
+    `<https://evil.example|Approved>` renders in the morning report as a real,
+    clickable link labelled "Approved" -- a phishing primitive delivered by
+    our own alerting. Per Slack's own guidance these three, and only these
+    three, are escaped; `*`/`_`/`` ` `` are harmless formatting.
+    """
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 class SlackNotifier:
     """NotifierPort backed by Slack. Live alerts (`alert`) are coalesced per
     title via `AlertCoalescer` -- a burst of per-image failures collapses into
@@ -131,12 +150,13 @@ class SlackNotifier:
         n = len(details)
         header = title if n == 1 else f"{title} ({n}x)"
         if n == 1:
-            body = details[0]
+            body = mrkdwn_escape(details[0])
         else:
             shown = details[:_MAX_LISTED]
-            body = "\n".join(f"- {d}" for d in shown)
+            body = "\n".join(f"- {mrkdwn_escape(d)}" for d in shown)
             if n > len(shown):
                 body += f"\n... and {n - len(shown)} more"
+        # HeaderBlock is plain_text, not mrkdwn, so the title needs no escaping.
         blocks = [HeaderBlock(text=header[:150]), SectionBlock(text=MarkdownTextObject(text=body))]
         await self._send_blocks(blocks, fallback_text=header)
 
@@ -197,7 +217,7 @@ def _render_morning_report_blocks(report: MorningReport) -> list[Block]:
     blocks.append(SectionBlock(text=MarkdownTextObject(text=f"*Completed:* {report.completed_count}{folder_line}")))
 
     if report.awaiting_approval:
-        lines = "\n".join(f"- `{r.asset.id}`" for r in report.awaiting_approval[:_MAX_LISTED])
+        lines = "\n".join(f"- `{mrkdwn_escape(r.asset.id)}`" for r in report.awaiting_approval[:_MAX_LISTED])
         blocks += [
             DividerBlock(),
             SectionBlock(
@@ -207,7 +227,8 @@ def _render_morning_report_blocks(report: MorningReport) -> list[Block]:
 
     if report.skipped_for_review:
         lines = "\n".join(
-            f"- `{r.asset.id}`: {skip_reason(r)}" for r in report.skipped_for_review[:_MAX_LISTED]
+            f"- `{mrkdwn_escape(r.asset.id)}`: {mrkdwn_escape(skip_reason(r))}"
+            for r in report.skipped_for_review[:_MAX_LISTED]
         )
         blocks += [
             DividerBlock(),
@@ -220,7 +241,8 @@ def _render_morning_report_blocks(report: MorningReport) -> list[Block]:
         # Its own section, never merged into "skipped for review": this means
         # the judge infrastructure broke, not that the asset failed the rubric.
         lines = "\n".join(
-            f"- `{r.asset.id}`: {error_reason(r)}" for r in report.judge_unavailable[:_MAX_LISTED]
+            f"- `{mrkdwn_escape(r.asset.id)}`: {mrkdwn_escape(error_reason(r))}"
+            for r in report.judge_unavailable[:_MAX_LISTED]
         )
         blocks += [
             DividerBlock(),
@@ -236,7 +258,8 @@ def _render_morning_report_blocks(report: MorningReport) -> list[Block]:
 
     if report.permanent_errors:
         lines = "\n".join(
-            f"- `{r.asset.id}`: {error_reason(r)}" for r in report.permanent_errors[:_MAX_LISTED]
+            f"- `{mrkdwn_escape(r.asset.id)}`: {mrkdwn_escape(error_reason(r))}"
+            for r in report.permanent_errors[:_MAX_LISTED]
         )
         blocks += [
             DividerBlock(),
@@ -271,8 +294,11 @@ def _render_failure_rate_table(rows: list[FailureRateRow]) -> str:
     header = f"{'workflow':<24} {'attempts':>8} {'successes':>10} {'fail %':>7}"
     lines = [header, "-" * len(header)]
     for row in rows:
+        # Escaped even inside the code fence: Slack still resolves `<...|...>`
+        # there on some clients, and `label` is a manifest-supplied path.
+        label = mrkdwn_escape(row.label[:24])
         lines.append(
-            f"{row.label[:24]:<24} {row.attempts:>8} {row.successes:>10} {row.failure_rate * 100:>6.1f}%"
+            f"{label:<24} {row.attempts:>8} {row.successes:>10} {row.failure_rate * 100:>6.1f}%"
         )
     return "\n".join(lines)
 

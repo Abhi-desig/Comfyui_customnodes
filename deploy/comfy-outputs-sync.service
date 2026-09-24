@@ -1,0 +1,33 @@
+# deploy/comfy-outputs-sync.service
+#
+# Runs ops/sync_outputs.sh as a persistent watch loop, streaming generated
+# outputs off the box as they're produced. Without a network volume, a
+# RunPod pod's local disk is gone the instant the pod is preempted or
+# stopped -- this is what turns "preemption loses the whole night" into
+# "preemption loses at most one in-flight asset". Independent of
+# comfy-controller.service: start it before the controller so nothing is
+# ever produced without a sync loop already watching for it.
+
+[Unit]
+Description=Stream ComfyUI outputs off-box as they are produced
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# TODO(operator): set these to match your deployment layout.
+User=comfy
+WorkingDirectory=/opt/comfy-controller
+EnvironmentFile=-/etc/comfy-controller/sync.env
+ExecStart=/opt/comfy-controller/ops/sync_outputs.sh
+# Final flush on stop, best-effort, before the watch loop's own ExecStart
+# process is sent SIGTERM.
+ExecStopPost=-/opt/comfy-controller/ops/sync_outputs.sh --once
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

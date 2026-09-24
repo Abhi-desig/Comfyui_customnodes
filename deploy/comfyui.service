@@ -1,0 +1,55 @@
+# deploy/comfyui.service
+#
+# STANDALONE unit for running ComfyUI under systemd's own supervision,
+# independent of comfy-controller.service.
+#
+# Read this before enabling it. There are two valid deployment modes, and
+# this unit only belongs in one of them:
+#
+#   Mode A (recommended, matches src/comfy_controller/supervisor.py):
+#     HealthSupervisor spawns and OWNS the ComfyUI process itself, directly,
+#     via asyncio.create_subprocess_exec (see `_launch_new_process` /
+#     `launch_argv` in supervisor.py). It needs that direct process handle
+#     for its canary-based restart logic -- systemd restarting ComfyUI out
+#     from under it would fight the supervisor's own restart discipline
+#     (hysteresis, backoff, the intensity ceiling). In this mode, do NOT
+#     enable this unit. comfy-controller.service is the only systemd unit
+#     that manages ComfyUI's lifecycle; this file exists for Mode B and for
+#     manual debugging (see below).
+#
+#   Mode B (only if the controller is configured to talk to an
+#     already-running ComfyUI over HTTP instead of spawning its own, i.e.
+#     HealthSupervisor constructed with launch_argv=None): then something
+#     has to keep ComfyUI up, and this unit is that something.
+#
+# Whichever mode you run, this is also the unit to `systemctl start
+# comfyui.service` by hand for manual debugging -- e.g. to check that
+# ops/launch_comfyui.sh and the #16312 guard-node verification work at all,
+# before wiring up the controller. See docs/runbook.md.
+#
+# ExecStart runs ops/launch_comfyui.sh, which pins the ComfyUI commit,
+# links comfyui_guard_node/ into custom_nodes/, launches ComfyUI with
+# --cache-none --disable-dynamic-vram, and refuses to hand back control
+# until the guard node's patch is confirmed from the startup log.
+
+[Unit]
+Description=ComfyUI (standalone; read the comments in this file before enabling)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# TODO(operator): set these to match your deployment layout.
+User=comfy
+WorkingDirectory=/opt/comfy-controller
+EnvironmentFile=-/etc/comfy-controller/comfyui.env
+ExecStart=/opt/comfy-controller/ops/launch_comfyui.sh
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

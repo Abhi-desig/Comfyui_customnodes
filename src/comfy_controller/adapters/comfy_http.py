@@ -22,6 +22,7 @@ import hashlib
 import json
 import uuid
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import aiohttp
@@ -52,6 +53,27 @@ def graph_hash(graph: dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+def validate_filename_prefix(filename_prefix: str) -> str:
+    """Reject anything that could make ComfyUI's `SaveImage` write outside its
+    own output directory.
+
+    `filename_prefix` is joined against ComfyUI's output dir server-side, so a
+    prefix carrying a path separator or a `..` component is a path-traversal
+    primitive. It is also what startup reconciliation globs for on disk, and a
+    key with a separator in it silently lands in a subdirectory the glob never
+    looks at. Both reasons say the same thing: keep it a flat, relative name.
+    """
+    if not filename_prefix:
+        raise ValueError("filename_prefix must not be empty")
+    if "/" in filename_prefix or "\\" in filename_prefix or "\x00" in filename_prefix:
+        raise ValueError(f"filename_prefix must not contain a path separator: {filename_prefix!r}")
+    if ".." in filename_prefix:
+        raise ValueError(f"filename_prefix must not contain '..': {filename_prefix!r}")
+    if Path(filename_prefix).is_absolute():
+        raise ValueError(f"filename_prefix must be relative: {filename_prefix!r}")
+    return filename_prefix
+
+
 def patch_graph(
     graph: dict[str, Any],
     *,
@@ -66,10 +88,17 @@ def patch_graph(
 
     Each of `seed` / `prompt_text` / `filename_prefix` is applied only when
     given (None = leave alone), targeting the first node matching the
-    conventional `class_type` (KSampler / CLIPTextEncode / SaveImage) unless
-    the matching `*_node` override names an explicit node id — needed the
-    moment a graph has more than one node of that type, e.g. separate
-    positive/negative CLIPTextEncode nodes.
+    conventional `class_type` (KSampler / CLIPTextEncode) unless the matching
+    `*_node` override names an explicit node id — needed the moment a graph
+    has more than one node of that type, e.g. separate positive/negative
+    CLIPTextEncode nodes.
+
+    `filename_prefix` is the exception: it is applied to EVERY `SaveImage`
+    node (unless `filename_prefix_node` names one explicitly). A graph that
+    saves more than one image would otherwise leave the second `SaveImage`
+    writing under whatever prefix the workflow author baked in, which both
+    collides across assets and hides that output from reconciliation's
+    job_key glob. It is validated by `validate_filename_prefix` first.
     """
     patched = copy.deepcopy(graph)
 
@@ -82,6 +111,16 @@ def patch_graph(
                 return node
         return None
 
+    def _targets(class_type: str, override: str | None) -> list[dict[str, Any]]:
+        if override is not None:
+            node = patched.get(override)
+            return [node] if isinstance(node, dict) else []
+        return [
+            node
+            for node in patched.values()
+            if isinstance(node, dict) and node.get("class_type") == class_type
+        ]
+
     if seed is not None:
         node = _target("KSampler", seed_node)
         if node is not None:
@@ -93,8 +132,8 @@ def patch_graph(
             node.setdefault("inputs", {})["text"] = prompt_text
 
     if filename_prefix is not None:
-        node = _target("SaveImage", filename_prefix_node)
-        if node is not None:
+        validate_filename_prefix(filename_prefix)
+        for node in _targets("SaveImage", filename_prefix_node):
             node.setdefault("inputs", {})["filename_prefix"] = filename_prefix
 
     return patched
@@ -280,24 +319,30 @@ class ComfyHTTP:
             return cached
 
         waiter = self._waiters.setdefault(prompt_id, asyncio.Event())
+        # Every exit path — resolved, timed out, cancelled, or the defensive
+        # RuntimeError below — must drop the waiter and stop treating the
+        # prompt as in flight. Leaking either means an unbounded dict for a
+        # batch that runs for hours, plus a /history round-trip for that dead
+        # prompt on every single websocket reconnect from here on.
         try:
-            await asyncio.wait_for(waiter.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            # One direct history check before giving up: covers an event that
-            # was missed entirely (dropped mid-gap, before any reconnect has
-            # had a chance to reconcile it).
-            entry = await self.history(prompt_id)
-            if entry is not None:
-                self._in_flight.discard(prompt_id)
-                self._waiters.pop(prompt_id, None)
-                return self._outcome_from_history(prompt_id, entry)
-            raise
+            try:
+                await asyncio.wait_for(waiter.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                # One direct history check before giving up: covers an event
+                # that was missed entirely (dropped mid-gap, before any
+                # reconnect has had a chance to reconcile it).
+                entry = await self.history(prompt_id)
+                if entry is not None:
+                    return self._outcome_from_history(prompt_id, entry)
+                raise
 
-        self._waiters.pop(prompt_id, None)
-        result = self._results.pop(prompt_id, None)
-        if result is None:  # pragma: no cover - defensive; _resolve always sets one
-            raise RuntimeError(f"waiter for {prompt_id} fired without a stored outcome")
-        return result
+            result = self._results.pop(prompt_id, None)
+            if result is None:  # pragma: no cover - defensive; _resolve always sets one
+                raise RuntimeError(f"waiter for {prompt_id} fired without a stored outcome")
+            return result
+        finally:
+            self._waiters.pop(prompt_id, None)
+            self._in_flight.discard(prompt_id)
 
     async def queue_depth(self) -> tuple[int, int]:
         data = await self._get_json("/queue")

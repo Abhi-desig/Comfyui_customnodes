@@ -1,0 +1,16 @@
+# deploy/comfy-deadman.service
+#
+# Dead-man's switch, LAYER 2: checks the controller's heartbeat file and, if
+# it has gone stale, terminates the instance (provider API first, local
+# shutdown as guaranteed fallback -- see ops/deadman.sh). Triggered
+# periodically by comfy-deadman.timer; not meant to be started directly
+# (no [Install] section -- the timer owns scheduling it).
+
+[Unit]
+Description=Dead-man's switch layer 2: terminate the instance if the controller heartbeat is stale
+After=comfy-deadman-boot.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/comfy-controller/deadman.env
+ExecStart=/opt/comfy-controller/ops/deadman.sh check-heartbeat
