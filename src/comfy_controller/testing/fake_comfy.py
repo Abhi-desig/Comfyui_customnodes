@@ -15,13 +15,21 @@ Faithful to the real server where it matters:
 from __future__ import annotations
 
 import asyncio
+import base64
 import enum
 import json
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from aiohttp import WSMsgType, web
+
+# Smallest valid PNG: 1x1, fully transparent. Decodable by Pillow.
+_PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+    "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+)
 
 
 class Fault(str, enum.Enum):
@@ -50,6 +58,11 @@ class FakeComfyState:
     fault_after_n_jobs: int = 0
     slow_seconds: float = 30.0
     step_delay: float = 0.01
+    # When set, actually write the PNG that `/history` claims exists. Real
+    # ComfyUI does, and the controller verifies the file is readable before
+    # judging -- a fake that only reports filenames lets that check pass
+    # vacuously. Left None by default so existing callers are unaffected.
+    output_dir: Path | None = None
     executed_count: int = 0
     submitted_count: int = 0
     free_calls: list[dict[str, bool]] = field(default_factory=list)
@@ -242,7 +255,9 @@ class FakeComfy:
                                               "value": i + 1, "max": 4}, cid)
 
         prefix = self._filename_prefix(job.graph)
-        outputs = {"9": {"images": [{"filename": f"{prefix}_00001_.png",
+        filename = f"{prefix}_00001_.png"
+        self._write_output(filename)
+        outputs = {"9": {"images": [{"filename": filename,
                                      "subfolder": "", "type": "output"}]}}
         await self._send("executed", {"node": "9", "output": outputs["9"], "prompt_id": pid}, cid)
         await self._send("executing", {"node": None, "prompt_id": pid}, cid)
@@ -251,6 +266,16 @@ class FakeComfy:
                               "status": {"status_str": "success", "completed": True,
                                          "messages": []}}
         self.state.executed_count += 1
+
+    def _write_output(self, filename: str) -> None:
+        """Write a real, decodable 1x1 PNG so the controller's readability
+        check (and any prefilter that opens the image) exercises the true
+        path rather than passing vacuously."""
+        if self.state.output_dir is None:
+            return
+        out = self.state.output_dir / filename
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(_PNG_1X1)
 
     @staticmethod
     def _filename_prefix(graph: dict[str, Any]) -> str:
