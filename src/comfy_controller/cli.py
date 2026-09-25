@@ -144,6 +144,8 @@ def build_runner(cfg: AppConfig) -> tuple[BatchRunner, SQLiteStore, ComfyHTTP]:
         stall_alert_s=cfg.stall_alert_s,
         milestone_fractions=cfg.milestone_fractions,
         comfy_output_dir=Path(cfg.comfy_output_dir) if cfg.comfy_output_dir else None,
+        heartbeat_file=Path(cfg.heartbeat_file) if cfg.heartbeat_file else None,
+        heartbeat_interval_s=cfg.heartbeat_interval_s,
         budget=BudgetLimits(
             max_wall_clock_s=cfg.budget.max_wall_clock_s,
             max_gpu_seconds=cfg.budget.max_gpu_seconds,
@@ -293,7 +295,38 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_preflight(args: argparse.Namespace) -> int:
+    from .preflight import run as run_preflight
+
+    return asyncio.run(
+        run_preflight(
+            args.config,
+            manifest_path=args.manifest,
+            quick=args.quick,
+            loop_count=args.loop,
+            loop_minutes=args.loop_minutes,
+            loop_interval_s=args.loop_interval_s,
+            comfyui_log_file=args.comfyui_log_file,
+            heartbeat_file=args.heartbeat_file,
+            min_free_gb=args.min_free_gb,
+            e2e_timeout_s=args.e2e_timeout_s,
+            test_image_path=args.test_image,
+        )
+    )
+
+
 def cmd_approve(args: argparse.Namespace) -> int:
+    """Approve an asset (typically PARKED_APPROVAL) for regeneration.
+
+    This does NOT mark the asset SAVED. The design intent -- and what a human
+    reviewer actually wants out of "approve" -- is "go make this one again",
+    not "the rejected output I'm looking at is secretly fine after all": the
+    judge already looked at what's on disk and it isn't SAVED, so promoting
+    it to SAVED unchanged would just be overriding the judge with no new
+    information. `requeue_for_regeneration` resets the row to a fresh,
+    immediately-claimable PENDING state (attempt/crash_count included), so
+    `comfyctl approve X && comfyctl resume` genuinely runs X again.
+    """
     cfg = AppConfig.load(args.config)
     store = SQLiteStore(cfg.db_path)
     try:
@@ -302,17 +335,10 @@ def cmd_approve(args: argparse.Namespace) -> int:
         if rec is None:
             print(f"Unknown asset id: {args.asset_id!r}", file=sys.stderr)
             return 1
-        asyncio.run(
-            store.transition(
-                args.asset_id,
-                AssetState.SAVED,
-                output_paths=rec.output_paths or None,
-                verdict=rec.last_verdict,
-            )
-        )
+        asyncio.run(store.requeue_for_regeneration(args.asset_id))
     finally:
         asyncio.run(store.close())
-    print(f"Approved {args.asset_id} -> SAVED")
+    print(f"Approved {args.asset_id} -> requeued for regeneration (PENDING). Run `comfyctl resume` to regenerate it.")
     return 0
 
 
@@ -337,7 +363,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--config", required=True)
     p_status.set_defaults(func=cmd_status)
 
-    p_approve = sub.add_parser("approve", help="Approve an asset (e.g. PARKED_APPROVAL) as SAVED.")
+    p_approve = sub.add_parser(
+        "approve", help="Approve an asset (e.g. PARKED_APPROVAL) for regeneration; run `resume` afterwards."
+    )
     p_approve.add_argument("--config", required=True)
     p_approve.add_argument("asset_id")
     p_approve.set_defaults(func=cmd_approve)
@@ -345,6 +373,48 @@ def build_parser() -> argparse.ArgumentParser:
     p_report = sub.add_parser("report", help="Print the morning report for the current DB.")
     p_report.add_argument("--config", required=True)
     p_report.set_defaults(func=cmd_report)
+
+    p_preflight = sub.add_parser(
+        "preflight", help="Self-check the real environment before trusting an unattended overnight run."
+    )
+    p_preflight.add_argument("--config", required=True)
+    p_preflight.add_argument("--manifest", default=None, help="Manifest to check workflow-specific requirements against.")
+    p_preflight.add_argument(
+        "--quick", action="store_true", help="Skip the paid Anthropic check and the full end-to-end check."
+    )
+    p_preflight.add_argument(
+        "--loop", type=int, default=None, metavar="N", help="Repeat the end-to-end check N times (a stability soak)."
+    )
+    p_preflight.add_argument(
+        "--loop-minutes", type=float, default=None, metavar="M",
+        help="Repeat the end-to-end check for M minutes instead of a fixed count.",
+    )
+    p_preflight.add_argument(
+        "--loop-interval-s", type=float, default=30.0, help="Delay between soak iterations (default 30s)."
+    )
+    p_preflight.add_argument(
+        "--comfyui-log-file", default=None,
+        help="Override the ComfyUI log checked for the guard-patch confirmation "
+        "(default: $COMFYUI_LOG_DIR/comfyui-latest.log).",
+    )
+    p_preflight.add_argument(
+        "--heartbeat-file", default=None,
+        help="Override the heartbeat path checked for writability "
+        "(default: $DEADMAN_HEARTBEAT_FILE or .comfy_supervisor/heartbeat).",
+    )
+    p_preflight.add_argument(
+        "--min-free-gb", type=float, default=10.0,
+        help="Minimum free disk space (GiB) at the output directory before this fails (default 10).",
+    )
+    p_preflight.add_argument(
+        "--e2e-timeout-s", type=float, default=300.0,
+        help="Timeout for each real ComfyUI generation this check submits (default 300s).",
+    )
+    p_preflight.add_argument(
+        "--test-image", default=None,
+        help="Path to an image to use for the Anthropic judge check instead of the bundled placeholder.",
+    )
+    p_preflight.set_defaults(func=cmd_preflight)
 
     return parser
 

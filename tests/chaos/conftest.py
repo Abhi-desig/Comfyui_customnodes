@@ -25,6 +25,7 @@ scenario must satisfy, and `unique_prompt_ids()`.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import sqlite3
@@ -99,6 +100,15 @@ class ScriptedOutcome:
 
 ScriptFn = Callable[[int], ScriptedOutcome]
 
+# Smallest valid PNG: 1x1, fully transparent -- decodable by Pillow. Same
+# bytes `FakeComfyState`'s own `_write_output` writes for the real (non-
+# scripted) path; duplicated here rather than imported so this module doesn't
+# reach into `fake_comfy`'s private constant.
+_SCRIPTED_OUTPUT_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+    "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+)
+
 
 def fail_once_then_succeed(exception_type: str, exception_message: str) -> ScriptFn:
     """attempt 0 (first submission) fails; every later attempt succeeds --
@@ -127,14 +137,25 @@ def always_succeed() -> ScriptFn:
 
 
 class RoutingComfy:
-    """Implements `ComfyPort`. See module docstring."""
+    """Implements `ComfyPort`. See module docstring.
 
-    def __init__(self, real: ComfyPort, scripts: dict[str, ScriptFn]):
+    `output_dir`, when given, makes every SCRIPTED "succeeded" outcome back
+    its claimed `output_paths` with a real, decodable PNG on disk -- not just
+    a filename string. Without this, turning `RunnerConfig.comfy_output_dir`
+    on for a run built from `RoutingComfy` would make `_unreadable_outputs`'s
+    real filesystem check fail every scripted asset (the file genuinely
+    doesn't exist), and leaving it off (the previous state of this suite)
+    means the judge/prefilter read-the-file path never actually runs for any
+    asset here -- exactly the gap that let a real bug ship unnoticed.
+    """
+
+    def __init__(self, real: ComfyPort, scripts: dict[str, ScriptFn], *, output_dir: Path | None = None):
         self._real = real
         self._scripts = scripts
         self._attempts: dict[str, int] = {}
         self._pending: dict[str, tuple[str, int]] = {}
         self._n = 0
+        self._output_dir = output_dir
 
     @staticmethod
     def _chaos_id(graph: dict[str, Any]) -> str | None:
@@ -165,6 +186,7 @@ class RoutingComfy:
         chaos_id, attempt = pending
         outcome = self._scripts[chaos_id](attempt)
         if outcome.succeeded:
+            self._write_scripted_outputs(outcome.output_paths)
             return JobOutcome(prompt_id=prompt_id, succeeded=True, output_paths=outcome.output_paths)
         return JobOutcome(
             prompt_id=prompt_id,
@@ -175,6 +197,22 @@ class RoutingComfy:
                 exception_message=outcome.exception_message,
             ),
         )
+
+    def _write_scripted_outputs(self, output_paths: list[str]) -> None:
+        """No-op when `output_dir` isn't configured (most existing chaos
+        scenarios don't care about real bytes on disk). When it IS
+        configured, every path a scripted "succeeded" outcome claims gets a
+        real, Pillow-decodable PNG underneath it, so
+        `BatchRunner._judge_or_park`'s `resolve_output_paths` +
+        `_unreadable_outputs` check, and the judge/prefilter's own
+        `Image.open`, exercise genuine bytes instead of passing vacuously."""
+        if self._output_dir is None:
+            return
+        for rel in output_paths:
+            path = self._output_dir / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                path.write_bytes(_SCRIPTED_OUTPUT_PNG)
 
     async def queue_depth(self) -> tuple[int, int]:
         return await self._real.queue_depth()

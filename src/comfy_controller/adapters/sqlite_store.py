@@ -425,6 +425,57 @@ class SQLiteStore:
                 self._conn.execute("ROLLBACK")
                 raise
 
+    async def requeue_for_regeneration(self, asset_id: str) -> None:
+        """Reset a row to a fresh, immediately-claimable PENDING state.
+
+        Not part of `StorePort` (frozen -- see ports.py's header comment):
+        this is an admin-only operation `comfyctl approve` uses, in the same
+        spirit as `runner.read_all_records` duck-typing onto this class for
+        reporting rather than widening the frozen protocol for one caller.
+
+        `comfyctl approve` means "generate this again", not "the last
+        generation was actually fine" -- that second meaning is what
+        `transition(..., AssetState.SAVED)` already covers. So this clears
+        everything that belongs to the rejected run (`comfy_prompt_id`,
+        `job_key`, the last error/verdict/output paths) and, crucially,
+        resets `attempt` and `crash_count` to 0. Leaving `attempt` as-is would
+        hand `RetryPolicy.next_action` (called with `attempt=row['attempt']`
+        straight from this table) a counter that's already partway up the
+        backoff ladder, so the very first hiccup of the freshly-approved
+        re-run could jump straight to a terminal state instead of getting the
+        same full set of chances any new asset gets -- the opposite of what
+        approving something is supposed to buy it.
+        """
+        await asyncio.to_thread(self._requeue_for_regeneration_sync, asset_id)
+
+    def _requeue_for_regeneration_sync(self, asset_id: str) -> None:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+                if row is None:
+                    self._conn.execute("ROLLBACK")
+                    raise KeyError(f"unknown asset id: {asset_id!r}")
+
+                self._conn.execute(
+                    """UPDATE assets
+                       SET state=?, attempt=0, job_key=NULL, comfy_prompt_id=NULL,
+                           output_paths_json='[]', last_error_json=NULL,
+                           last_verdict_json=NULL, crash_count=0, retry_after=NULL,
+                           reconciling=0
+                       WHERE id=?""",
+                    (AssetState.PENDING.value, asset_id),
+                )
+                self._log_run(
+                    asset_id, 0, AssetState.PENDING,
+                    prompt_id=None, error_type=None,
+                    verdict_summary="approved_for_regeneration", duration=None,
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
     async def needing_reconciliation(self) -> list[AssetRecord]:
         return await asyncio.to_thread(self._needing_reconciliation_sync)
 

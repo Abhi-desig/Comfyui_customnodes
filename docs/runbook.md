@@ -262,9 +262,9 @@ journalctl -u comfy-deadman-alert.service -b --no-pager
 # Layer 2 (heartbeat watchdog) -- confirm the timer is actually scheduled...
 systemctl list-timers comfy-deadman.timer
 # ...and that the heartbeat file is fresh (should be seconds/minutes old,
-# not hours -- if the controller isn't wired up to touch it yet, this will
-# always look stale, which the watchdog treats as fail-safe, not a bug --
-# see "Heartbeat contract" just below):
+# not hours -- if the controller hasn't finished starting yet, or isn't
+# running at all, this will look missing/stale, which the watchdog treats
+# as fail-safe, not a bug -- see "Heartbeat contract" just below):
 stat $DEADMAN_HEARTBEAT_FILE
 ```
 
@@ -278,33 +278,48 @@ Remember the ordering of guarantees: layer 3 (in-process budget counters
 inside the controller) is defense in depth *only*. It cannot substitute for
 layers 1/2 — a dead controller counts nothing.
 
-### Heartbeat contract (for whoever wires up `runner.py` — not yet implemented)
+### Heartbeat contract (implemented in `runner.py`)
 
-This is the precise spec layer 2 needs on the controller side. It is
-intentionally documented here rather than guessed at in `src/`:
+This is the precise spec layer 2 needs on the controller side, and what
+`BatchRunner._maybe_touch_heartbeat` (`src/comfy_controller/runner.py`)
+implements:
 
-- **Path**: `$DEADMAN_HEARTBEAT_FILE`, default
-  `/opt/comfy-controller/.comfy_supervisor/heartbeat` (shares
+- **Path**: `$DEADMAN_HEARTBEAT_FILE` / `RunnerConfig.heartbeat_file`
+  (`AppConfig.heartbeat_file`, overridable via `COMFYCTL_HEARTBEAT_FILE`),
+  default `/opt/comfy-controller/.comfy_supervisor/heartbeat` (shares
   `HealthSupervisor`'s existing `marker_dir` so there's one state directory
-  to know about, not two). Configurable via the env var of the same name.
-- **What to do**: touch the file (update its mtime) at least once per
-  control-loop iteration, and comfortably more often than
-  `DEADMAN_HEARTBEAT_STALE_MIN` (default 20min) — the natural cadence is
-  every `tick_interval_s` (`AppConfig` default 30s).
-- **Content**: irrelevant. Only mtime is read
-  (`ops/deadman.sh::_heartbeat_age_s()`). A bare `touch` satisfies the
-  contract; a small JSON blob (`{"ts": "...", "iteration": N}`) is a
-  nice-to-have for a human running `stat`/`cat` by hand, never required.
-- **Directory/permissions**: create the parent directory (`mkdir -p`) on
-  startup rather than assuming it exists, and make sure it's writable by
-  whatever user `comfy-controller.service` runs as (`User=` in that unit).
-- **Until this lands**: the file never gets created, so layer 2 always
-  takes the "heartbeat file never created" branch and terminates on every
-  run it reaches. That's fail-*safe*, not a false alarm — but note that
-  `comfy-controller.service`'s `ExecStopPost` now terminates the instance
-  proactively on a *clean* controller exit anyway (see §7), so the missing
-  heartbeat mainly affects catching a genuine *hang*, not a normal
-  successful run.
+  to know about, not two).
+- **What it does**: touches the file (updates its mtime, atomically —
+  temp-file + rename, so a reader never sees a half-written file) from
+  every worker loop's own iteration, plus a couple of extra checkpoints
+  right after a ComfyUI submit/poll round-trip resolves mid-asset. This is
+  throttled to at most once per `RunnerConfig.heartbeat_interval_s` (default
+  30s, comfortably more often than `DEADMAN_HEARTBEAT_STALE_MIN`'s default
+  20min) — but deliberately NOT implemented as a separate timer task: it has
+  to be driven by the workers actually making progress, or a wedged batch
+  (deadlocked on something that doesn't block the rest of the event loop)
+  would keep looking healthy forever. See that method's own comment for the
+  full reasoning.
+- **Content**: irrelevant to the contract. Only mtime is read
+  (`ops/deadman.sh::_heartbeat_age_s()`). The controller writes a small JSON
+  blob (`{"ts": ..., "iteration": N}`), which is a nice-to-have for a human
+  running `stat`/`cat` by hand, never required.
+- **Directory/permissions**: the controller creates the parent directory
+  (`mkdir -p`) on its first write rather than assuming it exists; make sure
+  it's writable by whatever user `comfy-controller.service` runs as
+  (`User=` in that unit).
+- **Startup grace period**: before the controller's first write (still
+  starting up — its own boot, or ComfyUI's model load), the file doesn't
+  exist yet. `ops/deadman.sh` tolerates that for `DEADMAN_STARTUP_GRACE_MIN`
+  (default 15min) rather than terminating a box that just hasn't finished
+  starting — see that script's `check_heartbeat()`.
+- **On a clean finish**: the heartbeat simply stops being touched once
+  `BatchRunner.run()` returns (every worker loop has exited) — it is
+  intentionally NOT the mechanism that tears the box down for a
+  successfully-finished run. `comfy-controller.service`'s `ExecStopPost`
+  (`ops/on_controller_stop.sh`) does that immediately on a clean exit (see
+  §7); the heartbeat's staleness timer exists for the wedged-but-still-
+  running case, not the finished-and-idle case.
 
 ## 7. Confirming the instance actually terminated
 

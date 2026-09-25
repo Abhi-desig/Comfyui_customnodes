@@ -94,6 +94,16 @@ class AppConfig(BaseModel):
     stall_alert_s: float = 900.0
     milestone_fractions: tuple[float, ...] = (0.25, 0.5, 0.75)
 
+    # ops/deadman.sh layer 2 reads this file's mtime; see that script's
+    # header comment and docs/runbook.md's "Heartbeat contract". The default
+    # here matches HealthSupervisor's own `marker_dir` default
+    # (".comfy_supervisor") so a bare local/dev run needs no extra config --
+    # a real deployment overrides this to match `DEADMAN_HEARTBEAT_FILE` via
+    # `COMFYCTL_HEARTBEAT_FILE` (see ops/env.example). Set to an empty string
+    # to disable heartbeat writing entirely.
+    heartbeat_file: str = ".comfy_supervisor/heartbeat"
+    heartbeat_interval_s: float = 30.0
+
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     supervisor: SupervisorConfig = Field(default_factory=SupervisorConfig)
     breaker: BreakerConfig = Field(default_factory=BreakerConfig)

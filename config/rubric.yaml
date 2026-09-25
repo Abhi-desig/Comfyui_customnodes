@@ -1,12 +1,69 @@
-# QC rubric for the Claude judge (adapters/claude_judge.py).
+# =============================================================================
+# QC rubric for the Claude judge (src/comfy_controller/adapters/claude_judge.py)
+# =============================================================================
 #
-# Design constraints this file exists to satisfy (see task brief):
+# This file is meant to be readable and editable by someone who has never
+# opened the Python code -- a marketing reviewer, not a programmer. If you
+# are that person: skip straight to the "checks:" section below. Everything
+# above it is infrastructure you shouldn't need to touch.
+#
+# -----------------------------------------------------------------------------
+# HOW TO WRITE A GOOD CHECK  (read this before adding or editing one)
+# -----------------------------------------------------------------------------
+# The #1 cause of the judge disagreeing with human reviewers is a badly
+# worded check -- not the model. `calibration.py` (see docs/calibration.md)
+# measures each check's agreement with human labels separately for exactly
+# this reason: a low score on one check should make you suspect that CHECK,
+# not conclude "the AI is bad at QC."
+#
+# A good check is:
+#
+#   1. SPECIFIC. "Is the lighting good?" invites a different mental model
+#      every time it's asked. "Is the lighting free of blown-out highlights
+#      and crushed, detail-less shadows?" describes one observable failure
+#      mode. If you can't picture the exact defect a "fail" is pointing at,
+#      rewrite the question until you can.
+#
+#   2. VISUALLY VERIFIABLE. The judge only ever sees pixels -- never the
+#      brief, the campaign goal, or the brand guidelines document. A check
+#      that requires outside knowledge ("does this match Q3 positioning?")
+#      can't be answered from the image and will get inconsistent answers.
+#      If outside knowledge is unavoidable, put it IN the question itself
+#      ("...clearly a university campus, not a generic office or home").
+#
+#   3. ONE THING PER CHECK. "Is the subject in frame and well-lit and
+#      on-brand?" is three checks wearing a trenchcoat. When it fails, you
+#      won't know which of the three broke, and neither will the judge's
+#      evidence, because it's forced to justify one pass/fail for all three
+#      at once. Split it. Checks are cheap; ambiguous checks are not.
+#
+#   4. BINARY. Every check here is yes/no by construction (no 1-10 scores --
+#      see the design note below). Write the question so a clear "no" is
+#      always a real defect, not a matter of taste. "Would this stop a
+#      scroll?" is inherently a taste question -- that's why it's marked
+#      `required: false` below, not because it doesn't matter.
+#
+# When you add exemplar images (see the `exemplar_images` /
+# `exemplar_fail_images` slots on each check), pick ones where the pass/fail
+# line is exactly what the question is asking about, not a generically
+# "good" or "bad" image -- an exemplar with three unrelated problems teaches
+# the judge the wrong lesson.
+#
+# -----------------------------------------------------------------------------
+# Design constraints this file exists to satisfy (see task brief for the
+# full rationale -- this is the short version, for whoever touches this
+# file's Python-facing structure):
 #   - binary yes/no checks only, no 1-10 scores
-#   - each check: name, question, required (bool), optional exemplar image paths
+#   - each check: name, question, required (bool), optional exemplar images
 #   - `required: false` checks are still asked (for context / grounding) but
-#     never gate `QCVerdict.passed` — see claude_judge.py's `_combine()` for
+#     never gate `QCVerdict.passed` -- see claude_judge.py's `_combine()` for
 #     why (QCVerdict.passed ANDs every entry in `checks`, and that model is
 #     frozen, so only required checks are allowed into that list).
+#   - `exemplar_fail_images` is a slot for human authors to fill in; the
+#     current loader (`RubricConfig.from_dict`) only reads `exemplar_images`
+#     (kept as the pass-exemplar field name for backwards compatibility) --
+#     wiring fail-exemplars into the actual prompt is a follow-up for
+#     whoever owns claude_judge.py, tracked here so it isn't forgotten.
 
 model: claude-opus-5
 # Cost lever: swap `model` for this when a batch needs to run cheaper. Quality
@@ -33,12 +90,12 @@ fix:
   bounds:
     adjust_steps: {min: -10, max: 10}
     adjust_strength: {min: -0.3, max: 0.3}
-  # `rewrite_slot` may only target one of these — anything else is rejected
+  # `rewrite_slot` may only target one of these -- anything else is rejected
   # outright (downgraded to action "none"). This is the prompt-injection
   # envelope: a hijacked judge can refine a named slot, never write arbitrary
   # free text into the generation prompt. The slot allowlist controls WHICH
   # node; `runner.sanitize_slot_text` / `compose_slot_text` control WHAT goes
-  # in it — a character-allowlisted phrase, appended to (never replacing) the
+  # in it -- a character-allowlisted phrase, appended to (never replacing) the
   # slot's authored text.
   slot_allowlist:
     - background
@@ -48,64 +105,103 @@ fix:
     - camera_angle
   max_text_length: 280
 
-# Six required checks + two optional (nice-to-have, non-blocking) checks —
-# within the 6-8 total the design calls for.
+# =============================================================================
+# THE CHECKS -- this is the part a non-programmer edits.
+# =============================================================================
+# Each check has:
+#   name                   short, unique, no spaces (used as an ID everywhere,
+#                          including in calibration reports -- keep it stable
+#                          once you start labelling images against it)
+#   question               the plain-English yes/no question asked about the
+#                          image (see "HOW TO WRITE A GOOD CHECK" above)
+#   required               true  = a "no" answer rejects the asset outright
+#                          false = still asked and reported, but never blocks
+#                          on its own (use this for subjective/nice-to-have
+#                          checks, e.g. "is this scroll-stopping?")
+#   exemplar_images        optional list of image paths (relative to this
+#                          file) showing a clear PASS for this specific check
+#   exemplar_fail_images   optional list of image paths showing a clear FAIL
+#                          for this specific check (see the loader note above
+#                          -- authored here as a slot even though not yet
+#                          consumed by claude_judge.py)
+#
+# Keep this to 6-8 checks total. More than that and each one gets a smaller
+# share of the model's attention; fewer and you're probably merging two
+# different failure modes into one check (see rule 3 above).
+
 checks:
   - name: subject_present
     question: >-
       Is the main subject described in the creative brief clearly visible,
       fully in frame, and not occluded or cropped off?
     required: true
+    exemplar_images: []
+    exemplar_fail_images: []
 
   - name: no_artifacts
     question: >-
-      Is the image free of generation artifacts — garbled text, warped
+      Is the image free of generation artifacts -- garbled text, warped
       objects, visible watermarks, or seams from inpainting/outpainting?
     required: true
+    exemplar_images: []
+    exemplar_fail_images: []
 
   - name: anatomy_correct
     question: >-
       Are there no anatomical errors: no extra or missing limbs/fingers, no
       malformed faces or hands?
     required: true
+    exemplar_images: []
+    exemplar_fail_images: []
 
   - name: matches_brief
     question: >-
       Does the image match the scene, setting, and mood described in the
       creative brief for this asset?
     required: true
+    exemplar_images: []
+    exemplar_fail_images: []
 
   - name: brand_palette_match
     question: >-
       Does the overall colour palette read as on-brand (cohesive, no
       clashing neon casts) rather than a jarring off-palette wash?
     required: true
+    exemplar_images: []
+    exemplar_fail_images: []
 
   - name: lighting_quality
     question: >-
       Is the lighting coherent and natural-looking, without blown-out
       highlights or crushed, detail-less shadows?
     required: true
+    exemplar_images: []
+    exemplar_fail_images: []
 
   - name: composition_polish
     question: >-
       Is the composition well-balanced (e.g. roughly rule-of-thirds) rather
       than accidental-looking?
-    required: false
+    required: false   # nice-to-have -- never blocks on its own
+    exemplar_images: []
+    exemplar_fail_images: []
 
   - name: aesthetic_appeal
     question: >-
       Would this image, on its own merits, be appealing enough to stop a
-      scroll on paid social? (Nice-to-have — never blocks on its own.)
-    required: false
+      scroll on paid social?
+    required: false   # nice-to-have, and inherently a matter of taste
+    exemplar_images: []
+    exemplar_fail_images: []
 
-# Shared few-shot images embedded once in the cached system prefix. Paths are
-# relative to this file's directory. Leave empty until reference assets exist;
-# wired up but inert.
+# Shared few-shot images embedded once in the cached system prefix, in
+# addition to any per-check exemplars above. Paths are relative to this
+# file's directory. Leave empty until reference assets exist; wired up but
+# inert.
 exemplar_images: []
 
 # Deterministic pre-checks (adapters/prefilter.py). numpy + Pillow only, no
-# network — an objective failure here means the API is never called for that
+# network -- an objective failure here means the API is never called for that
 # asset.
 prefilter:
   min_variance_of_laplacian: 40.0    # below this reads as out-of-focus/blurry
@@ -140,6 +236,8 @@ frame_consistency:
 # $ per 1,000,000 tokens. Mirrors the Claude API pricing table; keep in sync
 # if prices change. cache_read/cache_write are multipliers on the input rate
 # (per Anthropic's documented ~0.1x / ~1.25x), not separate absolute rates.
+# calibration.py's cost estimate reads this same table, so keeping it current
+# also keeps pre-flight spend estimates honest.
 pricing:
   claude-opus-5:
     input_per_mtok: 5.00

@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import random
 import re
 import threading
@@ -172,6 +173,20 @@ class RunnerConfig:
     comfy_output_dir: Path | None = None
     budget: BudgetLimits = field(default_factory=BudgetLimits)
     idle_poll_max_s: float = 5.0
+
+    # ops/deadman.sh layer 2 (the dead-man's switch's heartbeat watchdog)
+    # reads the mtime of this file and terminates the rented GPU instance
+    # once it goes stale -- see that script's header comment and
+    # docs/runbook.md's "Heartbeat contract" section, which is the spec this
+    # implements. None disables heartbeat writing entirely (e.g. tests that
+    # don't care about it); the default path mirrors HealthSupervisor's own
+    # `marker_dir` default so there is one state directory, not two.
+    heartbeat_file: Path | None = Path(".comfy_supervisor/heartbeat")
+    # How often the file is actually re-written. Throttled independently of
+    # any one asset's processing time -- see `_maybe_touch_heartbeat`'s own
+    # comment for why this is called from *every* worker-loop iteration
+    # rather than from a separate timer task.
+    heartbeat_interval_s: float = 30.0
 
 
 # --------------------------------------------------------------------- helpers
@@ -347,6 +362,15 @@ class BatchRunner:
         self._last_progress_at = 0.0
         self._stall_alerted = False
 
+        # Heartbeat (see RunnerConfig.heartbeat_file). `-inf` (not `0.0`: an
+        # injected test clock may legitimately start at 0.0, which would
+        # make the first call's `now - last < interval` check true and skip
+        # the write) so the very first worker-loop iteration always writes
+        # immediately rather than waiting a full `heartbeat_interval_s`.
+        self._last_heartbeat_write_at = float("-inf")
+        self._heartbeat_iteration = 0
+        self._heartbeat_lock = asyncio.Lock()
+
     # ------------------------------------------------------------------ run()
 
     async def run(self, assets: list[Asset] | None = None) -> None:
@@ -396,12 +420,31 @@ class BatchRunner:
         final_summary = await self.store.summary()
         records = read_all_records(self.store)
         await self._safe_notify(self.notifier.morning_report, final_summary, records)
+        # `run()` returning means every worker loop has exited, so nothing
+        # calls `_maybe_touch_heartbeat` again -- the heartbeat file is left
+        # exactly where it was at the last touch, and will (correctly) start
+        # aging from here. That is deliberately NOT how a normal finished
+        # batch tears the box down: `ops/on_controller_stop.sh`
+        # (deploy/comfy-controller.service's `ExecStopPost=`) fires the
+        # instant this process exits cleanly and terminates the instance
+        # right away via `ops/deadman.sh terminate`, rather than making a
+        # successful overnight run sit idle-and-billing until
+        # `DEADMAN_HEARTBEAT_STALE_MIN` elapses. The heartbeat's staleness
+        # timer exists for the *wedged-but-still-running* case; a clean exit
+        # is handled deliberately, not left for that timer to eventually
+        # notice.
 
     # -------------------------------------------------------------- workers
 
     async def _worker_loop(self, worker_id: int) -> None:
         idle_rounds = 0
         while not self._stop_event.is_set():
+            # The primary heartbeat checkpoint: every worker's own control
+            # loop, whether it's about to claim fresh work or is idle-polling
+            # because there's none yet. See `_maybe_touch_heartbeat`'s own
+            # comment for why this lives here and not in a detached task.
+            await self._maybe_touch_heartbeat()
+
             reason = await self._budget_exceeded()
             if reason:
                 await self._safe_notify(self.notifier.alert, "Budget exceeded", reason)
@@ -576,6 +619,10 @@ class BatchRunner:
                 )
             async with self._stats_lock:
                 self._gpu_seconds += self._clock() - t0
+            # Checkpoint: the submit/poll round-trip just completed, so this
+            # worker is demonstrably not wedged, even mid-asset on a single
+            # very long QC-repair round. See _maybe_touch_heartbeat.
+            await self._maybe_touch_heartbeat()
 
             if not outcome.succeeded:
                 await self._handle_execution_failure(record, outcome, partition)
@@ -840,6 +887,10 @@ class BatchRunner:
 
             await self.store.record_submission(asset.id, prompt_id)
             outcome = await self.comfy.await_outcome(prompt_id, timeout=self.config.await_outcome_timeout_s)
+            # Same checkpoint as _process_single: one frame's submit/poll
+            # round-trip just completed, so this worker is still alive even
+            # mid-sequence. See _maybe_touch_heartbeat.
+            await self._maybe_touch_heartbeat()
             if not outcome.succeeded:
                 error = outcome.error or ExecutionError(prompt_id=prompt_id, exception_message="unknown failure")
                 return await handle_frame_failure(i, error)
@@ -1202,6 +1253,70 @@ class BatchRunner:
             recycled = await self.supervisor.maybe_recycle(jobs)
             if recycled:
                 await self._safe_notify(self.notifier.alert, "Proactive recycle", f"restarted after {jobs} jobs")
+
+    # ----------------------------------------------------------- heartbeat
+
+    async def _maybe_touch_heartbeat(self) -> None:
+        """Refresh `RunnerConfig.heartbeat_file`'s mtime, throttled to at most
+        once per `heartbeat_interval_s`.
+
+        Called from the WORKER loop itself (`_worker_loop`'s own iteration,
+        plus the two checkpoints inside `_process_single`/`_process_sequence`
+        right after a `comfy.await_outcome` call resolves) rather than from a
+        separate `asyncio.create_task`'d timer. That distinction is the whole
+        point of this being a dead-man's-switch signal and not theatre: a
+        detached task whose only job is "sleep `interval`; touch; repeat"
+        keeps ticking on its own schedule even if the actual work -- the
+        worker loops that claim and process assets -- has deadlocked or
+        wedged on something that doesn't block the rest of the event loop
+        (an `await` that never resolves, two coroutines stuck on each other).
+        That would make the heartbeat lie about the one thing
+        `ops/deadman.sh` needs it to tell the truth about. Piggy-backing the
+        write on the workers' own forward progress means it can only look
+        healthy when the thing it's certifying -- the batch actually
+        advancing -- is itself still true.
+
+        Every call is cheap when throttled (one clock read under a lock), so
+        calling it from several places, including per QC-round/per-frame
+        checkpoints for a single very long-running asset, is deliberate: with
+        `concurrency=1` a single slow-but-healthy job would otherwise starve
+        the heartbeat for its entire `await_outcome_timeout_s`, which on a
+        long sequence is longer than a plausible `DEADMAN_HEARTBEAT_STALE_MIN`.
+        """
+        path = self.config.heartbeat_file
+        if path is None:
+            return
+        now = self._clock()
+        async with self._heartbeat_lock:
+            if now - self._last_heartbeat_write_at < self.config.heartbeat_interval_s:
+                return
+            self._last_heartbeat_write_at = now
+            self._heartbeat_iteration += 1
+            iteration = self._heartbeat_iteration
+        try:
+            await asyncio.to_thread(self._write_heartbeat_sync, path, iteration)
+        except OSError:
+            # Best-effort: a failed heartbeat write must never take down the
+            # batch. Worst case ops/deadman.sh's staleness check fires late
+            # (still fail-safe, never fail-open) -- it never fires *never*,
+            # because the file being unwritable is exactly as bad as the
+            # controller being dead from the dead-man's switch's point of
+            # view, and it will correctly go stale on its own.
+            log.exception("heartbeat.write_failed", path=str(path))
+
+    @staticmethod
+    def _write_heartbeat_sync(path: Path, iteration: int) -> None:
+        """Atomic temp-file + rename so `ops/deadman.sh`'s reader
+        (`stat`/`os.path.getmtime` on `path`) never observes a half-written
+        file -- only ever the previous complete one, or the new complete one.
+        Content is a nice-to-have for a human running `cat`; only the
+        resulting mtime is part of the actual contract (see
+        docs/runbook.md's "Heartbeat contract").
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+        tmp.write_text(json.dumps({"ts": time.time(), "iteration": iteration}))
+        os.replace(tmp, path)
 
     # -------------------------------------------------------------- budget
 

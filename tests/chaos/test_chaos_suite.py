@@ -29,8 +29,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from comfy_controller.adapters.comfy_http import ComfyHTTP
 from comfy_controller.adapters.console_notifier import ConsoleNotifier
@@ -58,9 +60,30 @@ from .conftest import (
 # ============================================================= the bulk run
 
 
+def _assert_genuinely_readable_png(path: Path) -> None:
+    """Not just "the file exists": genuinely decodable, matching what
+    `prefilter.evaluate`'s own `Image.open(path); img.load()` does. A stub
+    like `b"not-a-real-png"` (fine for the kill/resume suite, which only
+    checks existence) would fail this and must never be mistaken for
+    coverage of the judge/prefilter read-the-file path."""
+    assert path.is_file(), f"{path}: not a regular file"
+    assert path.stat().st_size > 0, f"{path}: 0-byte file"
+    with Image.open(path) as img:
+        img.load()
+
+
 @pytest.mark.slow
 async def test_bulk_chaos_run_every_asset_reaches_one_terminal_state(tmp_path):
-    fc = FakeComfy(FakeComfyState())
+    # `comfy_output_dir` configured end-to-end (FakeComfy's own write side AND
+    # the runner's read side) so this run genuinely exercises the judge/
+    # prefilter read-the-file path instead of leaving `comfy_output_dir`
+    # unset -- which is exactly the gap that let a real bug ship unnoticed
+    # (see RoutingComfy's own docstring in conftest.py for how scripted
+    # "succeeded" outcomes are backed by real files too, not just names).
+    output_dir = tmp_path / "comfy_outputs"
+    output_dir.mkdir()
+
+    fc = FakeComfy(FakeComfyState(output_dir=output_dir))
     base = await fc.start()
     real_client = ComfyHTTP(base, client_id="chaos-bulk")
 
@@ -114,7 +137,7 @@ async def test_bulk_chaos_run_every_asset_reaches_one_terminal_state(tmp_path):
     for oid in oom_ids:
         scripts[oid] = fail_once_then_succeed("torch.cuda.OutOfMemoryError", "CUDA out of memory")
 
-    comfy = RoutingComfy(real_client, scripts)
+    comfy = RoutingComfy(real_client, scripts, output_dir=output_dir)
 
     # ---- script the JudgePort side ----------------------------------------
     judge = RoutingJudge()
@@ -148,6 +171,7 @@ async def test_bulk_chaos_run_every_asset_reaches_one_terminal_state(tmp_path):
         tick_interval_s=2.0,
         await_outcome_timeout_s=20.0,
         idle_poll_max_s=0.5,
+        comfy_output_dir=output_dir,
     )
     runner = BatchRunner(
         comfy=comfy,
@@ -208,6 +232,44 @@ async def test_bulk_chaos_run_every_asset_reaches_one_terminal_state(tmp_path):
         assert breaker.state(wf_breaker_good) is BreakerState.CLOSED
 
         assert summary.get(AssetState.SAVED, 0) == 30 + len(oom_ids) + len(qcfix_ids) + len(breaker_good_ids)
+
+        # -- the read-the-file path itself: `comfy_output_dir` is configured
+        # for this whole run, so every SAVED asset's `output_paths` must
+        # resolve (via `BatchRunner.resolve_output_path`) to a real,
+        # Pillow-decodable file under `output_dir` -- not merely a filename
+        # string that happens to satisfy the `AssetState.SAVED` check. This
+        # is the exact path (`_unreadable_outputs` + the judge opening the
+        # image) that a shipped bug was previously free to break unnoticed,
+        # because the rest of this suite never configured `comfy_output_dir`
+        # at all. Covers every SAVED family: plain happy path, a
+        # once-then-succeeds OOM retry, a QC-fixed asset, and the surviving
+        # breaker partition.
+        saved_ids = (
+            [f"happy-{i}" for i in range(30)] + oom_ids + qcfix_ids + breaker_good_ids
+        )
+        assert saved_ids, "test setup: expected at least one SAVED asset"
+        for aid in saved_ids:
+            rec = records[aid]
+            assert rec.state == AssetState.SAVED
+            assert rec.output_paths, f"{aid}: SAVED with no recorded output_paths"
+            for rel_path in rec.output_paths:
+                _assert_genuinely_readable_png(runner.resolve_output_path(rel_path))
+
+        # And the judge itself was hand a real, already-resolved, existing
+        # path -- not a bare filename resolved against nothing (the old,
+        # vacuously-passing shape) -- for every asset whose scripted outcome
+        # reached the judge at all (SAVED, PARKED_APPROVAL, and the judge-
+        # unavailable storm all get this far before deciding).
+        judged_ids = saved_ids + qcpark_ids + storm_ids
+        judge_calls_by_asset: dict[str, list] = {}
+        for aid, paths in judge.calls:
+            judge_calls_by_asset.setdefault(aid, []).extend(paths)
+        for aid in judged_ids:
+            paths = judge_calls_by_asset.get(aid)
+            assert paths, f"{aid}: judge was never called with any image paths"
+            for path in paths:
+                assert path.is_absolute(), f"{aid}: {path} was never resolved against comfy_output_dir"
+                assert path.exists(), f"{aid}: judge was handed a path with nothing on disk: {path}"
     finally:
         await store.close()
         await real_client.close()
@@ -231,7 +293,14 @@ async def test_zombie_detected_restarts_and_loses_no_asset(tmp_path):
     wedged must still reach a terminal state once the (simulated) restart
     recovers it -- none may be silently lost.
     """
-    fc = FakeComfy(FakeComfyState(fault=Fault.ZOMBIE, fault_after_n_jobs=0))
+    # `output_dir` configured on both sides (FakeComfy's write side, the
+    # runner's read side below) so the victims that eventually complete after
+    # the restart go through the genuine judge/prefilter read-the-file path
+    # too, same rationale as the bulk run test.
+    output_dir = tmp_path / "comfy_outputs"
+    output_dir.mkdir()
+
+    fc = FakeComfy(FakeComfyState(fault=Fault.ZOMBIE, fault_after_n_jobs=0, output_dir=output_dir))
     base = await fc.start()
     comfy = ComfyHTTP(base, client_id="chaos-zombie")
 
@@ -290,11 +359,15 @@ async def test_zombie_detected_restarts_and_loses_no_asset(tmp_path):
     wf = tagged_workflow(tmp_path, "zombie_victim")
     assets = [Asset(id=f"victim-{i}", workflow=wf) for i in range(4)]
 
-    config = RunnerConfig(concurrency=4, tick_interval_s=0.05, await_outcome_timeout_s=2.0, idle_poll_max_s=0.1)
+    config = RunnerConfig(
+        concurrency=4, tick_interval_s=0.05, await_outcome_timeout_s=2.0, idle_poll_max_s=0.1,
+        comfy_output_dir=output_dir,
+    )
+    judge = FakeJudge()
     runner = BatchRunner(
         comfy=comfy,
         store=store,
-        judge=FakeJudge(),
+        judge=judge,
         supervisor=supervisor,
         notifier=ConsoleNotifier(),
         config=config,
@@ -308,6 +381,23 @@ async def test_zombie_detected_restarts_and_loses_no_asset(tmp_path):
 
         summary = await assert_all_terminal(store, len(assets))
         assert summary.get(AssetState.SAVED, 0) == len(assets)
+
+        # Every recovered victim's output is genuinely readable, not just a
+        # filename that satisfies AssetState.SAVED -- and the judge itself
+        # was handed the real, resolved, on-disk path.
+        records = {r.asset.id: r for r in read_all_records(store)}
+        judge_calls_by_asset: dict[str, list] = {}
+        for aid, paths in judge.calls:
+            judge_calls_by_asset.setdefault(aid, []).extend(paths)
+        for asset in assets:
+            rec = records[asset.id]
+            assert rec.output_paths, f"{asset.id}: SAVED with no recorded output_paths"
+            for rel_path in rec.output_paths:
+                _assert_genuinely_readable_png(runner.resolve_output_path(rel_path))
+            paths = judge_calls_by_asset.get(asset.id)
+            assert paths, f"{asset.id}: judge was never called"
+            for path in paths:
+                assert path.is_absolute() and path.exists()
     finally:
         healer.cancel()
         with contextlib.suppress(asyncio.CancelledError):

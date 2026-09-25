@@ -68,6 +68,8 @@ def _make_runner(
     concurrency: int = 2,
     breaker: CircuitBreaker | None = None,
     await_timeout: float = 20.0,
+    heartbeat_file: Path | None = None,
+    heartbeat_interval_s: float = 30.0,
 ) -> tuple[BatchRunner, SQLiteStore]:
     store = SQLiteStore(db_path)
     supervisor = HealthSupervisor(comfy, launch_argv=None, stall_timeout=600.0)
@@ -78,6 +80,12 @@ def _make_runner(
         tick_interval_s=3600.0,  # tick cadence irrelevant to these tests; keep it out of the way
         await_outcome_timeout_s=await_timeout,
         idle_poll_max_s=0.5,
+        # Disabled by default (None) so the many tests in this file that
+        # don't care about it never touch the filesystem outside `tmp_path`;
+        # RunnerConfig's own default (used by production wiring in cli.py)
+        # is a real relative path. Tests that DO care pass one explicitly.
+        heartbeat_file=heartbeat_file,
+        heartbeat_interval_s=heartbeat_interval_s,
     )
     runner = BatchRunner(
         comfy=comfy,
@@ -400,3 +408,85 @@ async def test_claim_next_uses_deterministic_job_key_fn(tmp_path):
     assert rec2.job_key is not None and rec2.job_key != expected
 
     await store.close()
+
+
+# ---------------------------------------------------------------- heartbeat
+
+
+async def test_heartbeat_written_during_run_and_frozen_after_it_stops(tmp_path):
+    """`ops/deadman.sh`'s layer 2 reads this file's mtime and terminates the
+    box once it goes stale. It must be touched while the batch is healthy,
+    and -- the actual point of driving it from the worker loop rather than a
+    detached timer -- it must NOT keep advancing once the run loop has
+    genuinely stopped."""
+    wf = _workflow_json(tmp_path)
+    assets = [Asset(id=f"a{i}", workflow=wf) for i in range(4)]
+    heartbeat_file = tmp_path / "hb" / "heartbeat"
+
+    fc, comfy = await _make_comfy_pair(FakeComfyState(fault=Fault.NONE))
+    runner, store = _make_runner(
+        comfy, FakeJudge(), tmp_path / "s.db",
+        concurrency=2, heartbeat_file=heartbeat_file, heartbeat_interval_s=0.0,
+    )
+    try:
+        await asyncio.wait_for(runner.run(assets), timeout=20.0)
+
+        assert heartbeat_file.is_file()
+        payload = json.loads(heartbeat_file.read_text())
+        assert payload["iteration"] >= 1
+        # Atomic temp+rename: no half-written leftovers at rest.
+        assert list(heartbeat_file.parent.glob(".*.tmp-*")) == []
+
+        mtime_after_run = heartbeat_file.stat().st_mtime_ns
+        await asyncio.sleep(0.2)
+        # run() returned -- no worker loop is iterating any more, so nothing
+        # should have touched the file again, no matter how long we wait.
+        assert heartbeat_file.stat().st_mtime_ns == mtime_after_run
+    finally:
+        await store.close()
+        await _teardown_comfy(fc, comfy)
+
+
+async def test_heartbeat_disabled_when_file_is_none(tmp_path):
+    wf = _workflow_json(tmp_path)
+    assets = [Asset(id="a0", workflow=wf)]
+
+    fc, comfy = await _make_comfy_pair(FakeComfyState(fault=Fault.NONE))
+    runner, store = _make_runner(comfy, FakeJudge(), tmp_path / "s.db", concurrency=1, heartbeat_file=None)
+    try:
+        await asyncio.wait_for(runner.run(assets), timeout=10.0)
+        # No path was ever configured, so nothing should appear under tmp_path.
+        assert not (tmp_path / ".comfy_supervisor").exists()
+    finally:
+        await store.close()
+        await _teardown_comfy(fc, comfy)
+
+
+async def test_heartbeat_throttled_to_configured_interval(tmp_path):
+    """Called from several checkpoints per asset, so it must not re-write the
+    file on every single call -- only once per `heartbeat_interval_s`. Uses
+    the runner's own injectable clock rather than real time so this is exact
+    and instant."""
+    heartbeat_file = tmp_path / "heartbeat"
+    clock = {"t": 0.0}
+    runner = BatchRunner(
+        comfy=object(),
+        store=object(),
+        judge=object(),
+        supervisor=object(),
+        notifier=object(),
+        config=RunnerConfig(heartbeat_file=heartbeat_file, heartbeat_interval_s=10.0),
+        clock=lambda: clock["t"],
+    )
+
+    await runner._maybe_touch_heartbeat()
+    assert heartbeat_file.is_file()
+    first_iteration = json.loads(heartbeat_file.read_text())["iteration"]
+
+    clock["t"] = 5.0  # still inside the interval -- must not write again
+    await runner._maybe_touch_heartbeat()
+    assert json.loads(heartbeat_file.read_text())["iteration"] == first_iteration
+
+    clock["t"] = 11.0  # past the interval -- writes again
+    await runner._maybe_touch_heartbeat()
+    assert json.loads(heartbeat_file.read_text())["iteration"] == first_iteration + 1

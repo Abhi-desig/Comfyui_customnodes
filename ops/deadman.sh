@@ -34,6 +34,15 @@
 #              dies or wedges mid-run); layer 1 is its backstop, not a
 #              replacement for it.
 #
+#              A missing heartbeat file is treated as fail-safe (terminate)
+#              EXCEPT during DEADMAN_STARTUP_GRACE_MIN after boot/restart
+#              (see check_heartbeat()/`_seconds_since_boot_marker()` below):
+#              the controller (and, before it, ComfyUI's own model load) can
+#              legitimately take a few minutes to come up and write its
+#              first heartbeat, and without a grace period layer 2 would
+#              terminate a perfectly healthy box that just hasn't finished
+#              starting yet.
+#
 #              The SAME terminate_instance() is also invoked proactively,
 #              via `ops/deadman.sh terminate <reason>`, from
 #              deploy/comfy-controller.service's ExecStopPost= the instant
@@ -77,31 +86,45 @@ set -euo pipefail
 # started" doesn't run the meter all weekend.
 DEADMAN_HARD_CEILING_MIN="${DEADMAN_HARD_CEILING_MIN:-660}"   # 11h
 
-# Layer 2: heartbeat contract -- precise spec for whoever wires this up in
-# src/comfy_controller/runner.py (NOT implemented here; this file only
-# reads the mtime side of the contract). See also docs/runbook.md's
-# "Heartbeat contract" section.
+# Layer 2: heartbeat contract -- implemented by
+# `BatchRunner._maybe_touch_heartbeat` in src/comfy_controller/runner.py
+# (this file only reads the mtime side of the contract). See also
+# docs/runbook.md's "Heartbeat contract" section.
 #   - Path: DEADMAN_HEARTBEAT_FILE below (default matches HealthSupervisor's
 #     existing marker_dir, default .comfy_supervisor/, so operators have one
 #     state directory to know about instead of two).
-#   - The controller must touch (update the mtime of) this file at least
-#     once per control-loop iteration, and comfortably more often than
-#     DEADMAN_HEARTBEAT_STALE_MIN (default 20min) -- in practice every
-#     `tick_interval_s` (AppConfig default 30s) is the natural cadence.
+#   - The controller touches (updates the mtime of) this file from its own
+#     worker loop -- not a detached timer -- at least once per
+#     `RunnerConfig.heartbeat_interval_s` (default 30s, comfortably more
+#     often than DEADMAN_HEARTBEAT_STALE_MIN below).
 #   - Only mtime is read (_heartbeat_age_s() below); file CONTENT is
-#     ignored, so a bare `touch` satisfies the contract. Writing a small
-#     JSON blob (e.g. {"ts": "...", "iteration": N}) is a nice-to-have for a
-#     human tailing the file by hand, never a requirement.
+#     ignored, so a bare `touch` satisfies the contract. The controller
+#     writes a small JSON blob (e.g. {"ts": ..., "iteration": N}), which is a
+#     nice-to-have for a human tailing the file by hand, never a requirement.
 #   - The parent directory must exist and be writable by whatever user
-#     comfy-controller.service runs as (`User=` in that unit); create it
-#     with `mkdir -p` on startup rather than assuming it's there.
-#   - Until this is wired up, the file never gets created and
-#     check_heartbeat() always takes the "heartbeat file never created"
-#     branch below -- by design this fails *safe* (terminates rather than
-#     idling forever), not a bug, but it does mean layer 2 fires on every
-#     run until the wiring lands.
+#     comfy-controller.service runs as (`User=` in that unit); the controller
+#     creates it with `mkdir -p` on its first write rather than assuming it's
+#     there.
+#   - Before the controller's first write (still starting up, e.g. ComfyUI's
+#     own model load), the file does not exist yet. check_heartbeat() below
+#     tolerates that for DEADMAN_STARTUP_GRACE_MIN -- past that, a still-
+#     missing file is treated the same as a dead controller (fail *safe*,
+#     not a false alarm).
 DEADMAN_HEARTBEAT_FILE="${DEADMAN_HEARTBEAT_FILE:-/opt/comfy-controller/.comfy_supervisor/heartbeat}"
 DEADMAN_HEARTBEAT_STALE_MIN="${DEADMAN_HEARTBEAT_STALE_MIN:-20}"
+
+# How long a MISSING heartbeat file is tolerated as "still starting up"
+# rather than "dead". Anchored to DEADMAN_BOOT_MARKER_FILE (below), a
+# tmpfs-backed marker this script itself creates the first time it notices
+# the heartbeat file is absent -- which, because comfy-deadman.timer's
+# OnBootSec=2min fires shortly after boot, approximates "time since boot"
+# (or since the controller's last restart, if the heartbeat file went
+# missing again later -- see check_heartbeat()'s own comment on why that's
+# also the right behaviour, not just an artifact of this implementation).
+DEADMAN_STARTUP_GRACE_MIN="${DEADMAN_STARTUP_GRACE_MIN:-15}"
+# /run is tmpfs: cleared on every reboot, which is exactly the "since boot"
+# semantics this marker needs. Override for tests/non-systemd hosts.
+DEADMAN_BOOT_MARKER_FILE="${DEADMAN_BOOT_MARKER_FILE:-/run/comfy-controller/deadman-boot-seen}"
 
 # Cloud provider for layer 2's API-based termination. One of:
 # runpod | lambda | vast | none
@@ -221,17 +244,51 @@ _heartbeat_age_s() {
     echo "$(( now - mtime ))"
 }
 
+# Seconds since this script first noticed the heartbeat file was missing, in
+# THIS boot (or since the controller's most recent restart -- see below).
+# Creates DEADMAN_BOOT_MARKER_FILE on first call and returns 0; every
+# subsequent call returns the elapsed time since then.
+_seconds_since_startup_marker() {
+    if [ ! -f "${DEADMAN_BOOT_MARKER_FILE}" ]; then
+        mkdir -p "$(dirname "${DEADMAN_BOOT_MARKER_FILE}")" 2>/dev/null || true
+        date +%s > "${DEADMAN_BOOT_MARKER_FILE}" 2>/dev/null || true
+        echo "0"
+        return
+    fi
+    now="$(date +%s)"
+    marker_ts="$(cat "${DEADMAN_BOOT_MARKER_FILE}" 2>/dev/null || echo "${now}")"
+    echo "$(( now - marker_ts ))"
+}
+
 check_heartbeat() {
     age_s="$(_heartbeat_age_s)"
     stale_after_s=$(( DEADMAN_HEARTBEAT_STALE_MIN * 60 ))
 
     if [ "${age_s}" -lt 0 ]; then
-        log "WARNING: heartbeat file ${DEADMAN_HEARTBEAT_FILE} does not exist yet."
-        log "         Until the controller is wired up to touch it, this looks identical"
-        log "         to a dead controller -- treat that as fail-safe, not a false alarm."
-        terminate_instance "heartbeat file never created"
+        grace_s=$(( DEADMAN_STARTUP_GRACE_MIN * 60 ))
+        since_startup_s="$(_seconds_since_startup_marker)"
+
+        if [ "${since_startup_s}" -lt "${grace_s}" ]; then
+            log "heartbeat file ${DEADMAN_HEARTBEAT_FILE} does not exist yet, but we're still within the" \
+                "${DEADMAN_STARTUP_GRACE_MIN}min startup grace period (${since_startup_s}s since first seen" \
+                "missing) -- the controller (or ComfyUI's own model load) may still be starting. Not terminating."
+            return
+        fi
+
+        log "WARNING: heartbeat file ${DEADMAN_HEARTBEAT_FILE} still does not exist after the" \
+            "${DEADMAN_STARTUP_GRACE_MIN}min startup grace period (${since_startup_s}s) -- treating this the" \
+            "same as a dead controller: fail safe, not a false alarm."
+        terminate_instance "heartbeat file never created (past ${DEADMAN_STARTUP_GRACE_MIN}min startup grace)"
         return
     fi
+
+    # The heartbeat file exists now, so startup is clearly done. Clear the
+    # marker so that if the file goes missing again LATER (e.g. the
+    # controller restarts and hasn't written its first heartbeat yet), that
+    # later gap gets its own fresh grace period rather than inheriting
+    # however little was left of this one -- a restarting controller needs
+    # the same startup time a first boot does.
+    rm -f "${DEADMAN_BOOT_MARKER_FILE}" 2>/dev/null || true
 
     if [ "${age_s}" -ge "${stale_after_s}" ]; then
         log "heartbeat is ${age_s}s old (stale after ${stale_after_s}s) -- controller looks dead"
@@ -346,47 +403,110 @@ escalate_shutdown() {
 }
 
 runpod_terminate() {
-    # Best-effort skeleton -- verify against RunPod's *current* API docs
-    # before relying on this in production. RunPod has historically exposed
-    # both a GraphQL API (api.runpod.io/graphql, podTerminate-style mutation)
-    # and a newer REST API (rest.runpod.io/v1); which one is current, and
-    # its exact mutation/field names, is exactly the kind of detail that
-    # goes stale and that a wrong guess would fail silently against a
-    # bill-generating API. Do not trust the call below without checking it
-    # yourself.
-    #
-    # TODO(operator): fill in / verify:
-    #   1. RUNPOD_API_KEY (env var, read below)
-    #   2. RUNPOD_POD_ID  (env var, read below)
-    #   3. The exact current endpoint + method + auth header + request body
-    #      for "terminate this pod" from RunPod's own API reference.
+    # RunPod REST API, confirmed directly against RunPod's own API reference
+    # (https://docs.runpod.io/api-reference/pods/DELETE/pods/podId --
+    # "Delete a Pod"):
+    #   DELETE https://rest.runpod.io/v1/pods/{podId}
+    #   Authorization: Bearer <RUNPOD_API_KEY>
+    #   204 = deleted; 400 = invalid pod id; 401 = unauthorized.
+    # (RunPod also has an older GraphQL API and a v2 REST surface; this is
+    # the current, documented v1 REST endpoint for exactly this operation.)
     if [ -z "${RUNPOD_API_KEY:-}" ] || [ -z "${RUNPOD_POD_ID:-}" ]; then
         log "RUNPOD_API_KEY / RUNPOD_POD_ID not set -- required for DEADMAN_PROVIDER=runpod"
         return 1
     fi
+    if ! command -v curl >/dev/null 2>&1; then
+        log "'curl' is not installed -- cannot call the RunPod API"
+        return 1
+    fi
 
-    log "TODO: RunPod terminate API call is not filled in -- see runpod_terminate() in this file."
-    log "      Pod ${RUNPOD_POD_ID} was NOT terminated via the RunPod API."
+    resp_file="$(mktemp "${TMPDIR:-/tmp}/deadman-runpod-XXXXXX")" || {
+        log "could not create a temp file for the RunPod API response"
+        return 1
+    }
+    # `if ! VAR=$(...); then` (not `VAR=$(...); rc=$?`) is deliberate: under
+    # `set -e`, a plain assignment statement that fails aborts the script
+    # immediately, same footgun as log()'s own comment describes for `tee`.
+    # Putting it in the `if` condition is what makes the failure something
+    # this function can actually handle.
+    if ! http_code="$(curl -sS --max-time 20 --connect-timeout 10 \
+        -o "${resp_file}" -w '%{http_code}' \
+        -X DELETE \
+        -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
+        "https://rest.runpod.io/v1/pods/${RUNPOD_POD_ID}" 2>>"${DEADMAN_LOG_FILE}")"
+    then
+        log "RunPod API call failed (curl network/TLS error) -- see ${DEADMAN_LOG_FILE}"
+        rm -f "${resp_file}"
+        return 1
+    fi
+    body="$(cat "${resp_file}" 2>/dev/null || true)"
+    rm -f "${resp_file}"
+
+    if [ "${http_code}" = "204" ]; then
+        log "RunPod API: pod ${RUNPOD_POD_ID} deleted (HTTP 204)"
+        return 0
+    fi
+
+    log "RunPod API terminate FAILED: HTTP ${http_code}${body:+ body=${body}}"
     return 1
 }
 
 lambda_terminate() {
-    # Best-effort skeleton -- verify against Lambda's *current* API docs
-    # before relying on this in production.
-    #
-    # TODO(operator): fill in / verify:
-    #   1. LAMBDA_API_KEY    (env var, read below)
-    #   2. LAMBDA_INSTANCE_ID (env var, read below)
-    #   3. The exact current endpoint + request body for "terminate this
-    #      instance" from Lambda Cloud's own API reference.
+    # Lambda Cloud public API, confirmed directly against Lambda's own API
+    # reference (https://docs.lambda.ai/api/cloud, "Terminate instances"):
+    #   POST https://cloud.lambda.ai/api/v1/instance-operations/terminate
+    #   Authorization: Bearer <LAMBDA_API_KEY>
+    #   Content-Type: application/json
+    #   Body:    {"instance_ids": ["<LAMBDA_INSTANCE_ID>"]}
+    #   Success: {"data": ...}
+    #   Error:   {"error": {"code": "...", "message": "..."}}
+    # The docs describing this endpoint didn't have the exact success status
+    # code visible (Lambda's other endpoints return 200), so this checks for
+    # a 2xx status AND the absence of an "error" key in the body, rather
+    # than hard-coding one specific 2xx code that might be wrong.
     if [ -z "${LAMBDA_API_KEY:-}" ] || [ -z "${LAMBDA_INSTANCE_ID:-}" ]; then
         log "LAMBDA_API_KEY / LAMBDA_INSTANCE_ID not set -- required for DEADMAN_PROVIDER=lambda"
         return 1
     fi
+    if ! command -v curl >/dev/null 2>&1; then
+        log "'curl' is not installed -- cannot call the Lambda Cloud API"
+        return 1
+    fi
 
-    log "TODO: Lambda terminate API call is not filled in -- see lambda_terminate() in this file."
-    log "      Instance ${LAMBDA_INSTANCE_ID} was NOT terminated via the Lambda API."
-    return 1
+    resp_file="$(mktemp "${TMPDIR:-/tmp}/deadman-lambda-XXXXXX")" || {
+        log "could not create a temp file for the Lambda API response"
+        return 1
+    }
+    request_body="{\"instance_ids\": [\"${LAMBDA_INSTANCE_ID}\"]}"
+    if ! http_code="$(curl -sS --max-time 20 --connect-timeout 10 \
+        -o "${resp_file}" -w '%{http_code}' \
+        -X POST \
+        -H "Authorization: Bearer ${LAMBDA_API_KEY}" \
+        -H "Content-Type: application/json" \
+        -d "${request_body}" \
+        "https://cloud.lambda.ai/api/v1/instance-operations/terminate" 2>>"${DEADMAN_LOG_FILE}")"
+    then
+        log "Lambda API call failed (curl network/TLS error) -- see ${DEADMAN_LOG_FILE}"
+        rm -f "${resp_file}"
+        return 1
+    fi
+    body="$(cat "${resp_file}" 2>/dev/null || true)"
+    rm -f "${resp_file}"
+
+    case "${http_code}" in
+        2??)
+            if printf '%s' "${body}" | grep -q '"error"'; then
+                log "Lambda API terminate FAILED: HTTP ${http_code} but body contains an error: ${body}"
+                return 1
+            fi
+            log "Lambda API: instance ${LAMBDA_INSTANCE_ID} terminate requested (HTTP ${http_code})"
+            return 0
+            ;;
+        *)
+            log "Lambda API terminate FAILED: HTTP ${http_code}${body:+ body=${body}}"
+            return 1
+            ;;
+    esac
 }
 
 vast_terminate() {
@@ -441,6 +561,13 @@ status() {
     age_s="$(_heartbeat_age_s)"
     if [ "${age_s}" -lt 0 ]; then
         echo "heartbeat file does not exist"
+        if [ -f "${DEADMAN_BOOT_MARKER_FILE}" ]; then
+            now="$(date +%s)"
+            marker_ts="$(cat "${DEADMAN_BOOT_MARKER_FILE}" 2>/dev/null || echo "${now}")"
+            echo "startup grace: $(( now - marker_ts ))s elapsed (grace period ${DEADMAN_STARTUP_GRACE_MIN}min)"
+        else
+            echo "startup grace: not started yet (will begin on the next check-heartbeat run)"
+        fi
     else
         echo "heartbeat age: ${age_s}s (stale after $(( DEADMAN_HEARTBEAT_STALE_MIN * 60 ))s)"
     fi

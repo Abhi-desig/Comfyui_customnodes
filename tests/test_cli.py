@@ -21,6 +21,7 @@ from comfy_controller.cli import build_parser, main
 from comfy_controller.config import AppConfig, ConfigError
 from comfy_controller.manifest import ManifestError, load_manifest
 from comfy_controller.models import Asset, AssetState, CheckResult, QCVerdict
+from comfy_controller.runner import read_all_records
 from comfy_controller.testing.fake_comfy import FakeComfy, FakeComfyState
 
 
@@ -233,21 +234,100 @@ def test_cli_status_reports_counts(tmp_path, capsys):
     assert "TOTAL" in out
 
 
-def test_cli_approve_transitions_to_saved(tmp_path, capsys):
+def test_cli_approve_requeues_for_regeneration_not_saved(tmp_path, capsys):
+    """`approve` must not silently rubber-stamp the rejected output as SAVED --
+    the design intent is "generate this again", and `comfyctl approve X &&
+    comfyctl resume` has to be the thing that actually regenerates it."""
     db_path = tmp_path / "s.db"
     _seeded_store(db_path)
     cfg_path = _write_yaml(tmp_path / "cfg.yaml", {"judge_backend": "fake", "db_path": str(db_path)})
 
     rc = main(["approve", "--config", str(cfg_path), "a0"])
     assert rc == 0
-    assert "Approved a0" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Approved a0" in out
+    assert "regenerat" in out.lower()
 
     store = SQLiteStore(db_path)
     import asyncio
 
     summary = asyncio.run(store.summary())
+    records = {r.asset.id: r for r in read_all_records(store)}
     asyncio.run(store.close())
-    assert summary.get(AssetState.SAVED) == 1
+
+    # Requeued, not fast-forwarded to SAVED. (`_seeded_store` also loads a1,
+    # untouched and already PENDING, so the total PENDING count is 2 -- a0's
+    # own state is the thing that matters here.)
+    assert summary.get(AssetState.SAVED, 0) == 0
+
+    rec = records["a0"]
+    assert rec.state is AssetState.PENDING
+    # Fresh chances: attempt/crash_count reset, and the rejected run's own
+    # verdict/output/error don't linger on a row that's about to be
+    # regenerated from scratch.
+    assert rec.attempt == 0
+    assert rec.crash_count == 0
+    assert rec.last_verdict is None
+    assert rec.output_paths == []
+
+
+async def test_cli_approve_then_resume_actually_regenerates(tmp_path):
+    """The end-to-end contract: `approve` followed by `resume` must produce a
+    brand new SAVED asset, not just flip a status flag."""
+    fc = FakeComfy(FakeComfyState())
+    base = await fc.start()
+    try:
+        wf = _workflow(tmp_path)
+        manifest = tmp_path / "m.yaml"
+        manifest.write_text(yaml.safe_dump([{"id": "a0", "workflow": str(wf)}]))
+        db_path = tmp_path / "run.db"
+        cfg_path = _write_yaml(
+            tmp_path / "cfg.yaml",
+            {
+                "judge_backend": "fake",
+                "db_path": str(db_path),
+                "comfy_base_url": base,
+                "concurrency": 1,
+                "tick_interval_s": 3600.0,
+            },
+        )
+
+        # Seed a0 straight into PARKED_APPROVAL, as if a prior run's judge
+        # rejected it -- never actually generated via this manifest/run.
+        store = SQLiteStore(db_path)
+        await store.load_batch([Asset(id="a0", workflow=str(wf))])
+        rec = await store.claim_next()
+        await store.record_submission(rec.asset.id, "stale-prompt-id")
+        await store.transition(
+            rec.asset.id,
+            AssetState.PARKED_APPROVAL,
+            verdict=QCVerdict(checks=[CheckResult(name="c", evidence="e", passed=False)]),
+            output_paths=["stale_out.png"],
+        )
+        await store.close()
+
+        # NOT `main(["approve", ...])` here: `cmd_approve` drives its own
+        # top-level `asyncio.run()` (see `cmd_approve`'s docstring / the CLI
+        # sync test above, which covers that path), which cannot nest inside
+        # the event loop this async test itself needs to keep FakeComfy's
+        # server alive -- same reasoning as `test_cli_run_end_to_end_then_
+        # resume`'s own docstring for calling `_run_batch` directly.
+        approve_store = SQLiteStore(db_path)
+        await approve_store.requeue_for_regeneration("a0")
+        await approve_store.close()
+
+        await cli_module._run_batch(str(cfg_path), None)
+
+        store2 = SQLiteStore(db_path)
+        summary = await store2.summary()
+        records = {r.asset.id: r for r in read_all_records(store2)}
+        await store2.close()
+
+        assert summary.get(AssetState.SAVED) == 1
+        assert records["a0"].comfy_prompt_id != "stale-prompt-id"
+        assert records["a0"].output_paths != ["stale_out.png"]
+    finally:
+        await fc.stop()
 
 
 def test_cli_approve_unknown_asset_id_fails(tmp_path, capsys):

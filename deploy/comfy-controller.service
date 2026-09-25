@@ -31,15 +31,16 @@
 # leading `-`: a genuine termination failure here is meant to mark this unit
 # `failed` so it's visible, not silent -- see ops/on_controller_stop.sh.
 #
-# Heartbeat contract (layer 2 of the dead-man's switch, NOT implemented by
-# this ops/ layer -- see ops/deadman.sh's own comment and
-# docs/runbook.md's "Heartbeat contract" section for the precise spec):
-# whatever runs as ExecStart here is expected to touch
-# DEADMAN_HEARTBEAT_FILE (default /opt/comfy-controller/.comfy_supervisor/heartbeat)
-# at least once per control-loop iteration, more often than
-# DEADMAN_HEARTBEAT_STALE_MIN (default 20min). Until that's wired up, layer
-# 2 will treat every run as a dead controller (fail-safe, not a false
-# alarm) -- see docs/runbook.md.
+# Heartbeat contract (layer 2 of the dead-man's switch, implemented by
+# BatchRunner._maybe_touch_heartbeat in src/comfy_controller/runner.py --
+# see ops/deadman.sh's own comment and docs/runbook.md's "Heartbeat
+# contract" section for the precise spec): ExecStart here touches
+# DEADMAN_HEARTBEAT_FILE / COMFYCTL_HEARTBEAT_FILE (default
+# /opt/comfy-controller/.comfy_supervisor/heartbeat) from its own worker
+# loop, at least once per RunnerConfig.heartbeat_interval_s (default 30s),
+# comfortably more often than DEADMAN_HEARTBEAT_STALE_MIN (default 20min).
+# Before the controller's first write, layer 2 tolerates a missing file for
+# DEADMAN_STARTUP_GRACE_MIN (default 15min) -- see docs/runbook.md.
 
 [Unit]
 Description=Comfy overnight batch controller (HealthSupervisor + runner)
